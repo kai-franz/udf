@@ -312,7 +312,10 @@ class UdfRewriter:
 
     def rewrite_header(self):
         """
-        Converts scalar parameters to arrays in the function header.
+        Converts the old function header to a batched function header, mainly by
+        making scalar parameters arrays.
         """
         for param in self.sql_tree.parameters:
             param.argType.arrayBounds = [ast.Integer(-1)]
+        # We don't want to accidentally replace an existing function
+        self.sql_tree.replace = False
