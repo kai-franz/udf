@@ -1,11 +1,10 @@
-import collections
-import itertools
-import json
 from enum import Enum
 from pglast import *
 from pglast import ast
+from pglast.enums import OnCommitAction
 from pglast.stream import IndentedStream
 from pglast.visitors import Visitor
+from typing import List
 
 
 class Type(Enum):
@@ -23,6 +22,13 @@ class Var:
 
     def __repr__(self):
         return self.__str__()
+
+
+class Param:
+
+    def __init__(self, param: ast.FunctionParameter):
+        self.name = param.name
+        self.type = param.argType
 
 
 indent = 4
@@ -64,18 +70,49 @@ class VarToArrayRefRewriter(Visitor):
             )
 
 
+class FunctionBodyRewriter(Visitor):
+    """
+    Replaces the function body in the SQL AST, where it is represented as a string,
+    with the new rewritten body.
+    """
+
+    def __init__(self, new_body: str):
+        self.new_body = new_body
+
+    def visit_DefElem(self, parent, node: ast.DefElem):
+        if node.defname == "as":
+            return ast.DefElem(defname="as", arg=(ast.String(self.new_body),))
+
+
 class UdfRewriter:
-    def __init__(self, tree: json):
-        self.tree = tree
-        # maps varnos to variable names
-        self.vars = {}
-        self.out = []
+    def __init__(self, f: str):
+        self.sql_tree = parse_sql(f)[0].stmt
+        self.tree = parse_plpgsql(f)[0]['PLpgSQL_function']
+        self.vars = {}  # maps varnos to variable names
+        self.out = []  # (nested) list of statements to output
+        self.params = [Param(param) for param in self.sql_tree.parameters]
+        self.rewrite_header()
         self.populate_vars()
         self.rewrite()
-        # print out the flattened program
-        print("\n".join(self.flatten_program(self.out)))
+        self.replace_function_body("\n".join(self.flatten_program(self.out)))
+
+    def output(self) -> str:
+        return IndentedStream()(self.sql_tree)
+
+    def replace_function_body(self, new_body):
+        """
+        Replaces the function body in the SQL AST, where it is represented as a string,
+        with the new rewritten body.
+        :param new_body:
+        :return:
+        """
+        FunctionBodyRewriter(new_body)(self.sql_tree)
 
     def populate_vars(self):
+        """
+        Parses the variables declared in the function and stores them in self.vars.
+        :return:
+        """
         for varno, node in enumerate(self.tree["datums"]):
             if "PLpgSQL_var" not in node:
                 continue
@@ -84,7 +121,13 @@ class UdfRewriter:
             if var_type != "UNKNOWN":
                 self.vars[varno] = Var(var["refname"], var_type)
 
-    def flatten_program(self, prog):
+    def flatten_program(self, prog) -> List[str]:
+        """
+        Flattens a program, which is a (nested) list of strings, into a single list of strings,
+        indenting statements as necessary.
+        :param prog: Program, as a string or (nested) list of strings
+        :return: Flattened program, as a list of strings
+        """
         if isinstance(prog, list):
             return [
                 subblock if isinstance(subblock, list) else tab + subblock
@@ -95,13 +138,21 @@ class UdfRewriter:
             return [prog]
 
     def put_declare(self):
+        """
+        Puts the DECLARE statement at the beginning of the function which declares local variables.
+        """
         self.out.append("DECLARE")
         block = []
         for var in self.vars.values():
             block.append(f"{var.name} {var.type.name}[];")
         self.out.append(block)
 
-    def put_batched_sql(self, stmt, block):
+    def put_batched_sql(self, stmt: dict, block: list):
+        """
+        Takes in a SQL statement, transforms it into a batched query, and appends it to the given output block.
+        :param stmt: PL/pgSQL AST for a SQL statement inside a UDF
+        :param block: List of statements to append output to
+        """
         # Make sure we are only SELECTing into one variable
         assert len(stmt["target"]["PLpgSQL_row"]["fields"]) == 1
         query_str = stmt["sqlstmt"]["PLpgSQL_expr"]["query"]
@@ -110,13 +161,18 @@ class UdfRewriter:
 
     def put_action(self):
         self.out.append("BEGIN")
-        block = [
-            "DROP TABLE IF EXISTS temp;",
-            "CREATE TEMP TABLE temp",
-            "(",
-            ") ON COMMIT DROP;",
-            "INSERT INTO temp SELECT * FROM UNNEST(params);",
-        ]
+
+        block = []
+
+        temp_table_cols = []
+        for param in self.params:
+            column = ast.ColumnDef(colname=param.name, typeName=param.type)
+            temp_table_cols.append(column)
+        create_table_stmt = ast.CreateStmt(relation=ast.RangeVar(relname="temp", inh=True, relpersistence='t', ),
+                                           tableElts=temp_table_cols,
+                                           oncommit=OnCommitAction.ONCOMMIT_DROP)
+        block += (IndentedStream()(create_table_stmt) + ";").split("\n")
+        block.append("INSERT INTO temp SELECT * FROM UNNEST(params);")
 
         self.put_block(
             self.tree["action"]["PLpgSQL_stmt_block"]["body"],
@@ -249,10 +305,14 @@ class UdfRewriter:
     def get_local_var_names(self):
         return set([var.name for var in self.vars.values()])
 
-    def put_end(self):
-        self.out.append("END;")
-
     def rewrite(self):
         self.put_declare()
         self.put_action()
-        self.put_end()
+        self.out.append("END;")
+
+    def rewrite_header(self):
+        """
+        Converts scalar parameters to arrays in the function header.
+        """
+        for param in self.sql_tree.parameters:
+            param.argType.arrayBounds = [ast.Integer(-1)]
