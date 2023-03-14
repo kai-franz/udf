@@ -87,9 +87,9 @@ def getUniqueColRefs(col_refs: List[ast.ColumnRef]):
     col_ref_strs = set()
     unique_col_refs = []
     for col_ref in col_refs:
-        if col_ref.fields[0].sval not in col_ref_strs:
+        if col_ref.fields[0].val not in col_ref_strs:
             unique_col_refs.append(col_ref)
-            col_ref_strs.add(col_ref.fields[0].sval)
+            col_ref_strs.add(col_ref.fields[0].val)
     return unique_col_refs
 
 
@@ -122,9 +122,8 @@ def transformQuery(q):
     subselect = ast.RangeSubselect(lateral=False, subquery=q[0].stmt, alias=ast.Alias("dt2"))
     q[0].stmt = ast.SelectStmt(targetList=outer_target_list, fromClause=(subselect,))
 
-    batched_func_call = ast.FuncCall(funcname=(ast.String(fn_call.funcname[0].sval + "_batched"),),
+    batched_func_call = ast.FuncCall(funcname=(ast.String(fn_call.funcname[0].val + "_batched"),),
                                      args=(ast.ColumnRef((ast.String("batch"),)),))
     indirection_target = ast.A_Indirection(arg=batched_func_call, indirection=(ast.A_Star(),))
     q[0].stmt.targetList = (ast.ResTarget(val=indirection_target),)
 
-    print("unique column refs:", col_refs)
