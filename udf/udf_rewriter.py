@@ -1,3 +1,4 @@
+import copy
 from enum import Enum
 from pglast import *
 from pglast import ast
@@ -178,7 +179,7 @@ class UdfRewriter:
             self.tree["action"]["PLpgSQL_stmt_block"]["body"],
             self.out,
             header=block,
-            footer="RETURN QUERY SELECT * FROM UNNEST(ret_vals);",
+            footer="RETURN ret_vals;",
             top_level=True,
         )
 
@@ -313,9 +314,14 @@ class UdfRewriter:
     def rewrite_header(self):
         """
         Converts the old function header to a batched function header, mainly by
-        making scalar parameters arrays.
+        making scalar parameters into arrays.
         """
         for param in self.sql_tree.parameters:
+            param.argType = copy.copy(param.argType)
             param.argType.arrayBounds = [ast.Integer(-1)]
+
+        # Change the return type to an array
+        self.sql_tree.returnType.arrayBounds = [ast.Integer(-1)]
+
         # We don't want to accidentally replace an existing function
         self.sql_tree.replace = False
