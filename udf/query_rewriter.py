@@ -80,13 +80,20 @@ def new_array_agg(col_refs: List[ast.ColumnRef]):
     """
     sort_by = []
     for col_ref in col_refs:
-        sort_by.append(ast.SortBy(node=col_ref, sortby_dir=SortByDir.SORTBY_DEFAULT,
-                                  sortby_nulls=SortByNulls.SORTBY_NULLS_DEFAULT))
+        sort_by.append(
+            ast.SortBy(
+                node=col_ref,
+                sortby_dir=SortByDir.SORTBY_DEFAULT,
+                sortby_nulls=SortByNulls.SORTBY_NULLS_DEFAULT,
+            )
+        )
 
     targetlist = []
     for col_ref in col_refs:
         batched_alias = col_ref.fields[0].val + "_batch"
-        func_call = ast.FuncCall(funcname=(ast.String("array_agg"),), args=[col_ref], agg_order=sort_by)
+        func_call = ast.FuncCall(
+            funcname=(ast.String("array_agg"),), args=[col_ref], agg_order=sort_by
+        )
         targetlist.append(ast.ResTarget(name=batched_alias, val=func_call))
     return targetlist
 
@@ -116,7 +123,7 @@ def transformQuery(q):
     select_stmt = q[0].stmt
     fn_calls = getFunctionCalls(q)
     col_refs = []
-    assert (len(fn_calls) == 1)
+    assert len(fn_calls) == 1
     fn_call = fn_calls[0]
     for arg in fn_call.args:
         if isinstance(arg, ast.ColumnRef):
@@ -132,18 +139,31 @@ def transformQuery(q):
         val = target.val
         if isinstance(val, ast.FuncCall):
             val.funcname = [ast.String(val.funcname[0].val + "_batch")]
-            val.args = [ast.ColumnRef([ast.String(arg.fields[0].val + "_batch")]) for arg in val.args]
+            val.args = [
+                ast.ColumnRef([ast.String(arg.fields[0].val + "_batch")])
+                for arg in val.args
+            ]
         if isinstance(val, ast.ColumnRef):
             # val.fields[0].val += "_batch"
-            val.fields = [ast.FuncCall(funcname=[ast.String('unnest')],
-                                       args=[ast.ColumnRef([ast.String(val.fields[0].val + "_batch")])])]
+            val.fields = [
+                ast.FuncCall(
+                    funcname=[ast.String("unnest")],
+                    args=[ast.ColumnRef([ast.String(val.fields[0].val + "_batch")])],
+                )
+            ]
 
     # push down the select statement into a subquery
-    subselect = ast.RangeSubselect(lateral=False, subquery=select_stmt, alias=ast.Alias("dt2"))
+    subselect = ast.RangeSubselect(
+        lateral=False, subquery=select_stmt, alias=ast.Alias("dt2")
+    )
     select_stmt = ast.SelectStmt(targetList=outer_target_list, fromClause=(subselect,))
 
-    batched_func_call = ast.FuncCall(funcname=(ast.String(fn_call.funcname[0].val + "_batch"),),
-                                     args=[ast.ColumnRef((ast.String("batch"),))])
-    indirection_target = ast.A_Indirection(arg=batched_func_call, indirection=(ast.A_Star(),))
+    batched_func_call = ast.FuncCall(
+        funcname=(ast.String(fn_call.funcname[0].val + "_batch"),),
+        args=[ast.ColumnRef((ast.String("batch"),))],
+    )
+    indirection_target = ast.A_Indirection(
+        arg=batched_func_call, indirection=(ast.A_Star(),)
+    )
     select_stmt.targetList = outer_target_list
     q[0].stmt = select_stmt

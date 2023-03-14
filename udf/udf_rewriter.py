@@ -26,7 +26,6 @@ class Var:
 
 
 class Param:
-
     def __init__(self, param: ast.FunctionParameter):
         self.name = param.name
         self.type = param.argType
@@ -67,7 +66,10 @@ class VarToArrayRefRewriter(Visitor):
     def visit_ColumnRef(self, parent, node: ast.ColumnRef):
         if node.fields[0].val in self.local_vars:
             return ast.A_Indirection(
-                arg=node, indirection=[ast.A_Indices(uidx=ast.ColumnRef(fields=[ast.String("i")]))]
+                arg=node,
+                indirection=[
+                    ast.A_Indices(uidx=ast.ColumnRef(fields=[ast.String("i")]))
+                ],
             )
 
 
@@ -88,7 +90,7 @@ class FunctionBodyRewriter(Visitor):
 class UdfRewriter:
     def __init__(self, f: str):
         self.sql_tree = parse_sql(f)[0].stmt
-        self.tree = parse_plpgsql(f)[0]['PLpgSQL_function']
+        self.tree = parse_plpgsql(f)[0]["PLpgSQL_function"]
         self.vars = {}  # maps varnos to variable names
         self.out = []  # (nested) list of statements to output
         self.params = [Param(param) for param in self.sql_tree.parameters]
@@ -169,9 +171,15 @@ class UdfRewriter:
         for param in self.params:
             column = ast.ColumnDef(colname=param.name, typeName=param.type)
             temp_table_cols.append(column)
-        create_table_stmt = ast.CreateStmt(relation=ast.RangeVar(relname="temp", inh=True, relpersistence='t', ),
-                                           tableElts=temp_table_cols,
-                                           oncommit=OnCommitAction.ONCOMMIT_DROP)
+        create_table_stmt = ast.CreateStmt(
+            relation=ast.RangeVar(
+                relname="temp",
+                inh=True,
+                relpersistence="t",
+            ),
+            tableElts=temp_table_cols,
+            oncommit=OnCommitAction.ONCOMMIT_DROP,
+        )
         block += (IndentedStream()(create_table_stmt) + ";").split("\n")
         block.append("INSERT INTO temp SELECT * FROM UNNEST(params);")
 
@@ -190,7 +198,9 @@ class UdfRewriter:
         block.append(loop_body)
         block.append("END LOOP;")
 
-    def put_block(self, tree: list, super_block, header=None, footer=None, top_level=False):
+    def put_block(
+        self, tree: list, super_block, header=None, footer=None, top_level=False
+    ):
         """
         Takes in a list of statements, creates a block containing these statements,
         and appends the block to the super_block.
