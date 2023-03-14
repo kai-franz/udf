@@ -184,11 +184,11 @@ class UdfRewriter:
         )
 
     def put_looped_stmt(self, stmt, block):
-        block.append("for i in array_lower(params, 1)..array_upper(params, 1) loop")
+        block.append("FOR i IN ARRAY_LOWER(params, 1)..ARRAY_UPPER(params, 1) LOOP")
         loop_body = []
         self.put_stmt(stmt, loop_body)
         block.append(loop_body)
-        block.append("end loop;")
+        block.append("END LOOP;")
 
     def put_block(self, tree: list, super_block, header=None, footer=None, top_level=False):
         """
