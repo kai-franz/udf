@@ -24,7 +24,7 @@ def convertFunctionHeader(f: ast.CreateFunctionStmt):
     f.returnType.names = tuple(returnTypeList)
 
 
-def removeFunctionCalls(parseTree):
+def getFunctionCalls(parseTree):
     """
     Removes all function calls from the query,
     returning the list of function calls removed.
@@ -32,21 +32,13 @@ def removeFunctionCalls(parseTree):
     :return: a list of function calls removed
     """
 
-    class FunctionCallRemover(Visitor):
+    class FunctionCallAccumulator(Visitor):
         function_calls = []
 
-        def visit_SelectStmt(self, parent, node):
-            non_function_calls = []
-            if node.targetList is None:
-                return
-            for target in node.targetList:
-                if isinstance(target.val, ast.FuncCall):
-                    self.function_calls.append(target.val)
-                else:
-                    non_function_calls.append(target)
-            node.targetList = non_function_calls
+        def visit_FuncCall(self, parent, node):
+            self.function_calls.append(node)
 
-    visitor = FunctionCallRemover()
+    visitor = FunctionCallAccumulator()
     visitor(parseTree)
     return visitor.function_calls
 
@@ -93,7 +85,7 @@ def new_array_agg(col_refs: List[ast.ColumnRef]):
 
     targetlist = []
     for col_ref in col_refs:
-        batched_alias = col_ref.fields[0].val + "_batched"
+        batched_alias = col_ref.fields[0].val + "_batch"
         func_call = ast.FuncCall(funcname=(ast.String("array_agg"),), args=[col_ref], agg_order=sort_by)
         targetlist.append(ast.ResTarget(name=batched_alias, val=func_call))
     return targetlist
@@ -121,7 +113,8 @@ def transformQuery(q):
     :return:
     """
     q[0].stmt = convertToSubquery(q[0].stmt)
-    fn_calls = removeFunctionCalls(q)
+    select_stmt = q[0].stmt
+    fn_calls = getFunctionCalls(q)
     col_refs = []
     assert (len(fn_calls) == 1)
     fn_call = fn_calls[0]
@@ -129,20 +122,28 @@ def transformQuery(q):
         if isinstance(arg, ast.ColumnRef):
             col_refs.append(arg)
 
-    udf_col_refs = copy.deepcopy(col_refs)
-    for target in q[0].stmt.targetList:
+    for target in select_stmt.targetList:
         if isinstance(target, ast.ResTarget) and isinstance(target.val, ast.ColumnRef):
             col_refs.append(target.val)
-
     col_refs = getUniqueColRefs(col_refs)
-    q[0].stmt.targetList = new_array_agg(udf_col_refs)
+    outer_target_list = select_stmt.targetList
+    select_stmt.targetList = new_array_agg(col_refs)
+    for target in outer_target_list:
+        val = target.val
+        if isinstance(val, ast.FuncCall):
+            val.funcname = [ast.String(val.funcname[0].val + "_batch")]
+            val.args = [ast.ColumnRef([ast.String(arg.fields[0].val + "_batch")]) for arg in val.args]
+        if isinstance(val, ast.ColumnRef):
+            # val.fields[0].val += "_batch"
+            val.fields = [ast.FuncCall(funcname=[ast.String('unnest')],
+                                       args=[ast.ColumnRef([ast.String(val.fields[0].val + "_batch")])])]
 
-    # push down q[0].stmt into a subquery
-    outer_target_list = (fn_call,)
-    subselect = ast.RangeSubselect(lateral=False, subquery=q[0].stmt, alias=ast.Alias("dt2"))
-    q[0].stmt = ast.SelectStmt(targetList=outer_target_list, fromClause=(subselect,))
+    # push down the select statement into a subquery
+    subselect = ast.RangeSubselect(lateral=False, subquery=select_stmt, alias=ast.Alias("dt2"))
+    select_stmt = ast.SelectStmt(targetList=outer_target_list, fromClause=(subselect,))
 
-    batched_func_call = ast.FuncCall(funcname=(ast.String(fn_call.funcname[0].val + "_batched"),),
-                                     args=(ast.ColumnRef((ast.String("batch"),)),))
+    batched_func_call = ast.FuncCall(funcname=(ast.String(fn_call.funcname[0].val + "_batch"),),
+                                     args=[ast.ColumnRef((ast.String("batch"),))])
     indirection_target = ast.A_Indirection(arg=batched_func_call, indirection=(ast.A_Star(),))
-    q[0].stmt.targetList = (ast.ResTarget(val=indirection_target),)
+    select_stmt.targetList = outer_target_list
+    q[0].stmt = select_stmt

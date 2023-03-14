@@ -325,3 +325,6 @@ class UdfRewriter:
 
         # We don't want to accidentally replace an existing function
         self.sql_tree.replace = False
+
+        # Change the function name
+        self.sql_tree.funcname = [ast.String(self.sql_tree.funcname[0].val + "_batch")]
