@@ -1,9 +1,11 @@
+import copy
 from typing import List
 
 from pglast import *
 import pglast
 import pprint
 from pglast import enums, ast
+from pglast.enums import SortByNulls, SortByDir
 from pglast.stream import IndentedStream, RawStream
 from pglast.visitors import Visitor, Delete, Skip
 
@@ -42,7 +44,7 @@ def removeFunctionCalls(parseTree):
                     self.function_calls.append(target.val)
                 else:
                     non_function_calls.append(target)
-            node.targetList = tuple(non_function_calls)
+            node.targetList = non_function_calls
 
     visitor = FunctionCallRemover()
     visitor(parseTree)
@@ -78,6 +80,25 @@ def getArrayAgg(q: ast.SelectStmt, col_refs: List[ast.ColumnRef]):
     return ast.ResTarget(name="batch", val=func_call)
 
 
+def new_array_agg(col_refs: List[ast.ColumnRef]):
+    """
+    Returns an array_agg function call with the given column references
+    :param col_refs:
+    :return:
+    """
+    sort_by = []
+    for col_ref in col_refs:
+        sort_by.append(ast.SortBy(node=col_ref, sortby_dir=SortByDir.SORTBY_DEFAULT,
+                                  sortby_nulls=SortByNulls.SORTBY_NULLS_DEFAULT))
+
+    targetlist = []
+    for col_ref in col_refs:
+        batched_alias = col_ref.fields[0].val + "_batched"
+        func_call = ast.FuncCall(funcname=(ast.String("array_agg"),), args=[col_ref], agg_order=sort_by)
+        targetlist.append(ast.ResTarget(name=batched_alias, val=func_call))
+    return targetlist
+
+
 def getUniqueColRefs(col_refs: List[ast.ColumnRef]):
     """
     Returns a list of unique column references
@@ -108,14 +129,13 @@ def transformQuery(q):
         if isinstance(arg, ast.ColumnRef):
             col_refs.append(arg)
 
+    udf_col_refs = copy.deepcopy(col_refs)
     for target in q[0].stmt.targetList:
-        if isinstance(target, ast.ResTarget):
-            if isinstance(target.val, ast.ColumnRef):
-                col_refs.append(target.val)
+        if isinstance(target, ast.ResTarget) and isinstance(target.val, ast.ColumnRef):
+            col_refs.append(target.val)
 
-    # get
     col_refs = getUniqueColRefs(col_refs)
-    q[0].stmt.targetList = (getArrayAgg(q[0].stmt, col_refs),)
+    q[0].stmt.targetList = new_array_agg(udf_col_refs)
 
     # push down q[0].stmt into a subquery
     outer_target_list = (fn_call,)
@@ -126,4 +146,3 @@ def transformQuery(q):
                                      args=(ast.ColumnRef((ast.String("batch"),)),))
     indirection_target = ast.A_Indirection(arg=batched_func_call, indirection=(ast.A_Star(),))
     q[0].stmt.targetList = (ast.ResTarget(val=indirection_target),)
-
