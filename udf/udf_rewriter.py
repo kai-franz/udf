@@ -186,6 +186,7 @@ class UdfRewriter:
         )
         block += (IndentedStream()(create_table_stmt) + ";").split("\n")
 
+        # INSERT INTO temp SELECT unnest(param1_batch), unnest(param2_batch), ...
         insert_stmt = ast.InsertStmt(
             relation=ast.RangeVar(relname="temp", inh=True, relpersistence="p"),
             selectStmt=ast.SelectStmt(
@@ -215,7 +216,9 @@ class UdfRewriter:
         )
 
     def put_looped_stmt(self, stmt, block):
-        block.append("FOR i IN ARRAY_LOWER(params, 1)..ARRAY_UPPER(params, 1) LOOP")
+        block.append(
+            f"FOR i IN ARRAY_LOWER({self.params[0].name}_batch, 1)..ARRAY_UPPER({self.params[0].name}_batch, 1) LOOP"
+        )
         loop_body = []
         self.put_stmt(stmt, loop_body)
         block.append(loop_body)
