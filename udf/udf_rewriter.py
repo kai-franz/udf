@@ -44,7 +44,6 @@ def split_assign(assign: str):
     # we split on the first equals sign, and then strip the whitespace
     # from the variable name and expression
     assign_exprs = [part.strip() for part in assign.split(":=")]
-    print(assign_exprs)
     assert len(assign_exprs) == 2
     return assign_exprs[0], assign_exprs[1]
 
@@ -251,6 +250,7 @@ class UdfRewriter:
 
     def put_stmt(self, stmt, block):
         if "PLpgSQL_stmt_assign" in stmt:
+            print("putting assign", stmt["PLpgSQL_stmt_assign"])
             sql = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
             lhs = self.vars[stmt["PLpgSQL_stmt_assign"]["varno"]]
             rhs_ast = parse_sql(sql)
@@ -271,11 +271,10 @@ class UdfRewriter:
                 self.put_block(stmt["PLpgSQL_stmt_if"]["else_body"], block)
             block.append("END IF;")
         elif "PLpgSQL_stmt_return" in stmt:
-            block.append(
-                "ret_vals[i] := ("
-                + stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
-                + ");"
-            )
+            sql = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
+            rhs_ast = parse_sql(sql)
+            VarToArrayRefRewriter(self.get_local_var_names())(rhs_ast)
+            block.append("ret_vals[i] := (" + IndentedStream()(rhs_ast) + ");")
         else:
             raise Exception("Unknown statement type: " + str(stmt))
 
