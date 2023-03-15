@@ -100,7 +100,7 @@ class UdfRewriter:
         self.replace_function_body("\n".join(self.flatten_program(self.out)))
 
     def output(self) -> str:
-        return IndentedStream()(self.sql_tree)
+        return IndentedStream()(self.sql_tree) + ";"
 
     def replace_function_body(self, new_body):
         """
@@ -234,16 +234,16 @@ class UdfRewriter:
             block.append(stmt["PLpgSQL_stmt_execsql"])
         elif "PLpgSQL_stmt_if" in stmt:
             block.append(
-                "if "
+                "IF ("
                 + stmt["PLpgSQL_stmt_if"]["cond"]["PLpgSQL_expr"]["query"]
-                + " then"
+                + ") THEN"
             )
             if "then_body" in stmt["PLpgSQL_stmt_if"]:
                 self.put_block(stmt["PLpgSQL_stmt_if"]["then_body"], block)
             if "else_body" in stmt["PLpgSQL_stmt_if"]:
-                block.append("else")
+                block.append("ELSE")
                 self.put_block(stmt["PLpgSQL_stmt_if"]["else_body"], block)
-            block.append("end if;")
+            block.append("END IF;")
         elif "PLpgSQL_stmt_return" in stmt:
             block.append(
                 "ret_vals[i] := "
