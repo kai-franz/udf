@@ -319,9 +319,6 @@ class UdfRewriter:
             lateral=True, subquery=select_stmt, alias=ast.Alias("dt1")
         )
         temp_table = ast.RangeVar(relname="temp", inh=True)
-        from_star = ast.ColumnRef((ast.A_Star(),))
-        from_target = ast.ResTarget(val=from_star)
-        outer_target_list = (from_target,)
 
         array_aggs = []
         for i in range(num_targets):
