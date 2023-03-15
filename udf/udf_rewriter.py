@@ -149,6 +149,7 @@ class UdfRewriter:
         for var in self.vars.values():
             block.append(f"{var.name} {var.type.name}[];")
         block.append(f"ret_vals {self.sql_tree.returnType.names[1].val}[];")
+        block.append("returned BOOL[];")
         self.out.append(block)
 
     def put_batched_sql(self, stmt: dict, block: list):
@@ -274,7 +275,14 @@ class UdfRewriter:
             sql = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
             rhs_ast = parse_sql(sql)
             VarToArrayRefRewriter(self.get_local_var_names())(rhs_ast)
-            block.append("ret_vals[i] := (" + IndentedStream()(rhs_ast) + ");")
+            block.append("IF returned[i] IS NULL THEN")
+            block.append(
+                [
+                    "ret_vals[i] := (" + IndentedStream()(rhs_ast) + ");",
+                    "returned[i] := TRUE;",
+                ]
+            )
+            block.append("END IF;")
         else:
             raise Exception("Unknown statement type: " + str(stmt))
 
