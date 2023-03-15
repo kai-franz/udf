@@ -1,13 +1,7 @@
-import copy
 from typing import List
-
-from pglast import *
-import pglast
-import pprint
-from pglast import enums, ast
+from pglast import ast
 from pglast.enums import SortByNulls, SortByDir
-from pglast.stream import IndentedStream, RawStream
-from pglast.visitors import Visitor, Delete, Skip
+from pglast.visitors import Visitor
 
 
 def convertFunctionHeader(f: ast.CreateFunctionStmt):
@@ -17,7 +11,6 @@ def convertFunctionHeader(f: ast.CreateFunctionStmt):
     f.parameters = [ast.FunctionParameter("argarray", argType=argType)]
 
     # convert return statement to a table
-    # retTypeName =
     f.returnType.setof = True
     returnTypeList = list(f.returnType.names)
     returnTypeList[1] = ast.String("record")
@@ -143,8 +136,9 @@ def transformQuery(q):
                 ast.ColumnRef([ast.String(arg.fields[0].val + "_batch")])
                 for arg in val.args
             ]
+            unnest_call = ast.FuncCall(funcname=[ast.String("unnest")], args=[val])
+            target.val = unnest_call
         if isinstance(val, ast.ColumnRef):
-            # val.fields[0].val += "_batch"
             val.fields = [
                 ast.FuncCall(
                     funcname=[ast.String("unnest")],
