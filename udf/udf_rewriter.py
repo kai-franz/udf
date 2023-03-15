@@ -50,7 +50,7 @@ def split_assign(assign: str):
 
 
 def gen_assign_stmt(lhs: str, rhs: str):
-    return lhs + " := " + rhs
+    return lhs + " := " + rhs + ""
 
 
 class VarToArrayRefRewriter(Visitor):
@@ -96,7 +96,7 @@ class UdfRewriter:
         self.params = [Param(param) for param in self.sql_tree.parameters]
         self.rewrite_header()
         self.populate_vars()
-        self.rewrite()
+        self.rewrite_body()
         self.replace_function_body("\n".join(self.flatten_program(self.out)))
 
     def output(self) -> str:
@@ -144,10 +144,12 @@ class UdfRewriter:
         """
         Puts the DECLARE statement at the beginning of the function which declares local variables.
         """
+        self.out.append("")
         self.out.append("DECLARE")
         block = []
         for var in self.vars.values():
             block.append(f"{var.name} {var.type.name}[];")
+        block.append(f"ret_vals {self.sql_tree.returnType.names[1].val}[];")
         self.out.append(block)
 
     def put_batched_sql(self, stmt: dict, block: list):
@@ -160,7 +162,9 @@ class UdfRewriter:
         assert len(stmt["target"]["PLpgSQL_row"]["fields"]) == 1
         query_str = stmt["sqlstmt"]["PLpgSQL_expr"]["query"]
         into_var = stmt["target"]["PLpgSQL_row"]["fields"][0]["name"]
-        block += self.batch_query(query_str, into=into_var).split("\n")
+        batched_query = self.batch_query(query_str, into=into_var).split("\n")
+        batched_query[-1] += ";"
+        block += batched_query
 
     def put_action(self):
         self.out.append("BEGIN")
@@ -181,7 +185,26 @@ class UdfRewriter:
             oncommit=OnCommitAction.ONCOMMIT_DROP,
         )
         block += (IndentedStream()(create_table_stmt) + ";").split("\n")
-        block.append("INSERT INTO temp SELECT * FROM UNNEST(params);")
+
+        insert_stmt = ast.InsertStmt(
+            relation=ast.RangeVar(relname="temp", inh=True, relpersistence="p"),
+            selectStmt=ast.SelectStmt(
+                targetList=[
+                    ast.ResTarget(
+                        val=ast.FuncCall(
+                            funcname=[ast.String("unnest")],
+                            args=[
+                                ast.ColumnRef(
+                                    fields=[ast.String(param.name + "_batch")]
+                                )
+                                for param in self.params
+                            ],
+                        )
+                    )
+                ]
+            ),
+        )
+        block += (IndentedStream()(insert_stmt) + ";").split("\n")
 
         self.put_block(
             self.tree["action"]["PLpgSQL_stmt_block"]["body"],
@@ -229,7 +252,7 @@ class UdfRewriter:
             lhs = self.vars[stmt["PLpgSQL_stmt_assign"]["varno"]]
             rhs_ast = parse_sql(sql)
             VarToArrayRefRewriter(self.get_local_var_names())(rhs_ast)
-            block.append(lhs.name + "[i] := " + IndentedStream()(rhs_ast) + ";")
+            block.append(lhs.name + "[i] := (" + IndentedStream()(rhs_ast) + ");")
         elif "PLpgSQL_stmt_execsql" in stmt:
             block.append(stmt["PLpgSQL_stmt_execsql"])
         elif "PLpgSQL_stmt_if" in stmt:
@@ -246,9 +269,9 @@ class UdfRewriter:
             block.append("END IF;")
         elif "PLpgSQL_stmt_return" in stmt:
             block.append(
-                "ret_vals[i] := "
+                "ret_vals[i] := ("
                 + stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
-                + ";"
+                + ");"
             )
         else:
             raise Exception("Unknown statement type: " + str(stmt))
@@ -260,6 +283,8 @@ class UdfRewriter:
             assign_stmt = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
             batched_sql = self.batch_query(assign_stmt).split("\n")
             varno = stmt["PLpgSQL_stmt_assign"]["varno"]
+            batched_sql[0] = "(" + batched_sql[0]
+            batched_sql[-1] = batched_sql[-1] + ");"
             batched_sql[0] = gen_assign_stmt(self.vars[varno].name, batched_sql[0])
             block += batched_sql
         else:
@@ -311,12 +336,12 @@ class UdfRewriter:
         if into is not None:
             new_query.intoClause = self.generate_into_clause(into)
 
-        return IndentedStream()(new_query) + ";"
+        return IndentedStream()(new_query)
 
     def get_local_var_names(self):
         return set([var.name for var in self.vars.values()])
 
-    def rewrite(self):
+    def rewrite_body(self):
         self.put_declare()
         self.put_action()
         self.out.append("END;")
@@ -329,6 +354,7 @@ class UdfRewriter:
         for param in self.sql_tree.parameters:
             param.argType = copy.copy(param.argType)
             param.argType.arrayBounds = [ast.Integer(-1)]
+            param.name = param.name + "_batch"
 
         # Change the return type to an array
         self.sql_tree.returnType.arrayBounds = [ast.Integer(-1)]
