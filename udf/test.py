@@ -1,7 +1,7 @@
 from query_rewriter import *
 from udf_rewriter import *
 
-q_no_filter = """select c_customer_sk, increaseInWebSpending(c_customer_sk, bill_customer_sk)
+q_no_filter = """select c_customer_sk, increaseInWebSpending(c_customer_sk)
 from customer
 where c_customer_sk in
 	(select ws_bill_customer_sk
