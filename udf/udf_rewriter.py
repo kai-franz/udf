@@ -93,13 +93,15 @@ class UdfRewriter:
         self.vars = {}  # maps varnos to variable names
         self.out = []  # (nested) list of statements to output
         self.params = [Param(param) for param in self.sql_tree.parameters]
+
         self.rewrite_header()
         self.populate_vars()
         self.rewrite_body()
         self.replace_function_body("\n".join(self.flatten_program(self.out)))
+        self.output = IndentedStream()(self.sql_tree) + ";"
 
     def output(self) -> str:
-        return IndentedStream()(self.sql_tree) + ";"
+        return self.output
 
     def replace_function_body(self, new_body):
         """
@@ -141,7 +143,7 @@ class UdfRewriter:
 
     def put_declare(self):
         """
-        Puts the DECLARE statement at the beginning of the function which declares local variables.
+        Puts the DECLARE statement at the beginning of the function (declares local variables).
         """
         self.out.append("")
         self.out.append("DECLARE")
@@ -260,11 +262,10 @@ class UdfRewriter:
         elif "PLpgSQL_stmt_execsql" in stmt:
             block.append(stmt["PLpgSQL_stmt_execsql"])
         elif "PLpgSQL_stmt_if" in stmt:
-            block.append(
-                "IF ("
-                + stmt["PLpgSQL_stmt_if"]["cond"]["PLpgSQL_expr"]["query"]
-                + ") THEN"
-            )
+            sql = stmt["PLpgSQL_stmt_if"]["cond"]["PLpgSQL_expr"]["query"]
+            cond_ast = parse_sql(sql)
+            VarToArrayRefRewriter(self.get_local_var_names())(cond_ast)
+            block.append("IF (" + IndentedStream()(cond_ast) + ") THEN")
             if "then_body" in stmt["PLpgSQL_stmt_if"]:
                 self.put_block(stmt["PLpgSQL_stmt_if"]["then_body"], block)
             if "else_body" in stmt["PLpgSQL_stmt_if"]:
@@ -301,6 +302,11 @@ class UdfRewriter:
             self.put_looped_stmt(stmt, block)
 
     def generate_into_clause(self, var_name: str):
+        """
+        Generates an INTO clause equivalent to "INTO var_name".
+        :param var_name:
+        :return:
+        """
         return ast.IntoClause(
             rel=ast.RangeVar(relname=var_name, inh=True),
             onCommit=enums.OnCommitAction.ONCOMMIT_NOOP,
