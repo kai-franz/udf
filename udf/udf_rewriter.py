@@ -8,15 +8,30 @@ from pglast.visitors import Visitor
 from typing import List
 
 
-class Type(Enum):
+class BaseType(Enum):
     INT = 1
     DECIMAL = 2
+    FLOAT = 3
+    # handle cases like DECIMAL(10, 2)
+
+
+class Type:
+    def __init__(self, type_str: str):
+        self.type_str = type_str
+        if "(" in type_str:
+            base_type = type_str.split("(")[0]
+        else:
+            base_type = type_str
+        self.base_type = BaseType[base_type]
+
+    def __str__(self):
+        return self.type_str
 
 
 class Var:
     def __init__(self, name: str, type: str):
         self.name = name
-        self.type = Type[type]
+        self.type = Type(type)
 
     def __str__(self):
         return f"{self.name}: {self.type}"
@@ -98,10 +113,10 @@ class UdfRewriter:
         self.populate_vars()
         self.rewrite_body()
         self.replace_function_body("\n".join(self.flatten_program(self.out)))
-        self.output = IndentedStream()(self.sql_tree) + ";"
+        self.output_sql = IndentedStream()(self.sql_tree) + ";"
 
     def output(self) -> str:
-        return self.output
+        return self.output_sql
 
     def replace_function_body(self, new_body):
         """
@@ -149,7 +164,7 @@ class UdfRewriter:
         self.out.append("DECLARE")
         block = []
         for var in self.vars.values():
-            block.append(f"{var.name} {var.type.name}[];")
+            block.append(f"{var.name} {var.type}[];")
         block.append(f"ret_vals {self.sql_tree.returnType.names[1].val}[];")
         block.append("returned BOOL[];")
         self.out.append(block)
@@ -253,7 +268,6 @@ class UdfRewriter:
 
     def put_stmt(self, stmt, block):
         if "PLpgSQL_stmt_assign" in stmt:
-            print("putting assign", stmt["PLpgSQL_stmt_assign"])
             sql = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
             lhs = self.vars[stmt["PLpgSQL_stmt_assign"]["varno"]]
             rhs_ast = parse_sql(sql)
@@ -273,6 +287,14 @@ class UdfRewriter:
                 self.put_block(stmt["PLpgSQL_stmt_if"]["else_body"], block)
             block.append("END IF;")
         elif "PLpgSQL_stmt_return" in stmt:
+            if "expr" not in stmt["PLpgSQL_stmt_return"]:
+                # Implicit return, e.g.
+                # IF () THEN ... RETURN x; ELSE ... RETURN y; END IF;
+                # <implicit return>
+                #
+                # We don't codegen anything in this case.
+                return
+
             sql = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
             rhs_ast = parse_sql(sql)
             VarToArrayRefRewriter(self.get_local_var_names())(rhs_ast)
