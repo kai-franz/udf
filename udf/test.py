@@ -1,68 +1,31 @@
 from query_rewriter import *
 from udf_rewriter import *
+import sys
 
-q_no_filter = """select c_customer_sk, increaseInWebSpending(c_customer_sk)
-from customer
-where c_customer_sk in
-	(select ws_bill_customer_sk
-	from web_sales_history, date_dim
-	where d_date_sk = ws_sold_date_sk
-		and d_year = 2000
+query_input_dir = sys.argv[1]
+udf_input_dir = sys.argv[2]
+output_dir = sys.argv[3]
 
-	INTERSECT
+udfs = [1, 5, 6, 7, 12, 13]
+files = [f"sudf_{udf}.sql" for udf in udfs]
 
-	select ws_bill_customer_sk
-	from web_sales_history, date_dim
-	where d_date_sk = ws_sold_date_sk
-		and d_year = 2001
-	)"""
 
-f = """
-CREATE OR REPLACE FUNCTION increaseInWebSpending(cust_sk INT)
-    RETURNS DECIMAL
-    LANGUAGE plpgsql
-AS
-$$
-DECLARE
-    spending1 DECIMAL;
-    spending2 DECIMAL;
-    increase  DECIMAL;
-BEGIN
-    spending1 := 0;
-    spending2 := 0;
-    increase := 0;
+def rewrite_query(query_file_name, udf_file_name, output_file_name):
+    print("Rewriting", query_file_name)
+    with open(query_file_name, "r") as query_file:
+        query = query_file.read()
+    with open(udf_file_name, "r") as udf_file:
+        udf = udf_file.read()
+    root_q = parse_sql(query)
+    transformQuery(root_q)
+    rewriter = UdfRewriter(udf)
+    with open(output_file_name, "w") as out_file:
+        out_file.write(rewriter.output())
+        out_file.write("\n\n\n")
+        out_file.write(IndentedStream()(root_q))
 
-    SELECT SUM(ws_net_paid_inc_ship_tax)
-      INTO spending1
-      FROM web_sales_history,
-           date_dim
-     WHERE d_date_sk = ws_sold_date_sk
-       AND d_year = 2001
-       AND ws_bill_customer_sk = cust_sk;
 
-    SELECT SUM(ws_net_paid_inc_ship_tax)
-      INTO spending2
-      FROM web_sales_history,
-           date_dim
-     WHERE d_date_sk = ws_sold_date_sk
-       AND d_year = 2000
-       AND ws_bill_customer_sk = cust_sk;
-
-    IF (spending1 < spending2) THEN
-        RETURN -1;
-    ELSE
-        increase := spending1 - spending2;
-    END IF;
-    RETURN increase;
-
-END;
-$$;"""
-
-root_q = parse_sql(q_no_filter)
-transformQuery(root_q)
-with open("query_out.sql", "w") as query_out:
-    query_out.write(IndentedStream()(root_q))
-root = parse_plpgsql(f)[0]["PLpgSQL_function"]
-rewriter = UdfRewriter(f)
-with open("udf_out.sql", "w") as udf_out:
-    udf_out.write(rewriter.output())
+for file in files:
+    rewrite_query(
+        f"{query_input_dir}/{file}", f"{udf_input_dir}/{file}", f"{output_dir}/{file}"
+    )
