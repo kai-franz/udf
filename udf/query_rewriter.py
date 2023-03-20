@@ -2,6 +2,7 @@ import copy
 from typing import List
 from pglast import ast
 from pglast.enums import SortByNulls, SortByDir
+from pglast.stream import IndentedStream
 from pglast.visitors import Visitor
 
 
@@ -67,7 +68,7 @@ def getArrayAgg(q: ast.SelectStmt, col_refs: List[ast.ColumnRef]):
     return ast.ResTarget(name="batch", val=func_call)
 
 
-def new_array_agg(col_refs: List[ast.ColumnRef]):
+def new_array_agg(col_refs: List):
     """
     Returns an array_agg function call with the given column references
     :param col_refs:
@@ -85,7 +86,12 @@ def new_array_agg(col_refs: List[ast.ColumnRef]):
 
     targetlist = []
     for col_ref in col_refs:
-        batched_alias = col_ref.fields[0].val + "_batch"
+        if isinstance(col_ref, ast.ColumnRef):
+            batched_alias = col_ref.fields[0].val + "_batch"
+        elif isinstance(col_ref, ast.A_Const):
+            batched_alias = str(col_ref.val.val) + "_batch"
+        else:
+            batched_alias = "query_" + str(hash(str(col_ref))) + "_batch"
         func_call = ast.FuncCall(
             funcname=(ast.String("array_agg"),), args=[col_ref], agg_order=sort_by
         )
@@ -99,13 +105,15 @@ def getUniqueColRefs(col_refs: List[ast.ColumnRef]):
     :param col_refs:
     :return:
     """
-    col_ref_strs = set()
-    unique_col_refs = []
-    for col_ref in col_refs:
-        if col_ref.fields[0].val not in col_ref_strs:
-            unique_col_refs.append(col_ref)
-            col_ref_strs.add(col_ref.fields[0].val)
-    return unique_col_refs
+
+    # TODO(kai): for now we don't worry about deduplication
+    # col_ref_strs = set()
+    # unique_col_refs = []
+    # for col_ref in col_refs:
+    #     if col_ref.fields[0].val not in col_ref_strs:
+    #         unique_col_refs.append(col_ref)
+    #         col_ref_strs.add(col_ref.fields[0].val)
+    return col_refs
 
 
 def transformQuery(q, udf_name):
@@ -118,41 +126,55 @@ def transformQuery(q, udf_name):
     q[0].stmt = convertToSubquery(subquery)
     select_stmt = q[0].stmt
     fn_calls = getFunctionCalls(q, udf_name)
-    col_refs = []
-    print(fn_calls)
+    inner_targets = []
     assert len(fn_calls) == 1
     fn_call = fn_calls[0]
-    for arg in fn_call.args:
-        if isinstance(arg, ast.ColumnRef):
-            col_refs.append(arg)
+    fn_call_args = fn_call.args
 
-    for target in select_stmt.targetList:
-        if isinstance(target, ast.ResTarget) and isinstance(target.val, ast.ColumnRef):
-            col_refs.append(target.val)
-    col_refs = getUniqueColRefs(col_refs)
-    outer_target_list = select_stmt.targetList
-    select_stmt.targetList = new_array_agg(col_refs)
+    # for target in select_stmt.targetList:
+    #     if not (
+    #         isinstance(target.val, ast.FuncCall)
+    #         and target.val.funcname[0].val == udf_name
+    #     ):
+    #         col_refs.append(target.val)
+    # print(inner_targets)
+    # col_refs = getUniqueColRefs(col_refs)
+    unnest_target_list = copy.deepcopy(select_stmt.targetList)
+    select_stmt.targetList = new_array_agg(list(inner_targets) + list(fn_call_args))
 
     # TODO(kai): make sure these are all the columns we need from the inner query
     inner_target_list = [
         target
-        for target in copy.deepcopy(outer_target_list)
-        if isinstance(target.val, ast.ColumnRef)
+        for target in copy.deepcopy(unnest_target_list)
+        if not (
+            isinstance(target.val, ast.FuncCall)
+            and target.val.funcname[0].val == udf_name
+        )
     ]
-    for target in outer_target_list:
+    # Construct unnest_target_list, which is the target list for the outer query.
+    # This consists of unnesting columns that we were previously selecting,
+    # as well as unnesting the function call result.
+    for target in unnest_target_list:
         val = target.val
+        # The UDF call. Change this to unnest the batched version of the function.
         if isinstance(val, ast.FuncCall):
             val.funcname = [ast.String(val.funcname[0].val + "_batch")]
-            val.args = [
-                ast.ColumnRef(
-                    [
-                        ast.String(arg.fields[0].val + "_batch")
-                        if isinstance(arg, ast.ColumnRef)
-                        else arg
-                    ]
-                )
-                for arg in val.args
-            ]
+            new_args = []
+            for arg in val.args:
+                if isinstance(arg, ast.FuncCall) and arg.funcname[0].val == udf_name:
+                    continue
+                if isinstance(arg, ast.ColumnRef):
+                    new_args.append(
+                        ast.ColumnRef([ast.String(arg.fields[0].val + "_batch")])
+                    )
+                elif isinstance(arg, ast.A_Const):
+                    new_args.append(ast.ColumnRef([str(arg.val.val) + "_batch"]))
+                else:
+                    new_args.append(
+                        ast.ColumnRef(["query_" + str(hash(str(arg))) + "_batch"])
+                    )
+
+            val.args = new_args
             unnest_call = ast.FuncCall(funcname=[ast.String("unnest")], args=[val])
             target.val = unnest_call
         if isinstance(val, ast.ColumnRef):
@@ -162,16 +184,16 @@ def transformQuery(q, udf_name):
                     args=[ast.ColumnRef([ast.String(val.fields[0].val + "_batch")])],
                 )
             ]
+        if isinstance(val, ast.A_Const):
+            target.val = ast.FuncCall(
+                funcname=[ast.String("unnest")],
+                args=[ast.ColumnRef(["_batch"])],
+            )
     subquery.targetList = inner_target_list
     # push down the select statement into a subquery
     subselect = ast.RangeSubselect(
         lateral=False, subquery=select_stmt, alias=ast.Alias("dt2")
     )
-    select_stmt = ast.SelectStmt(targetList=outer_target_list, fromClause=(subselect,))
-
-    batched_func_call = ast.FuncCall(
-        funcname=(ast.String(fn_call.funcname[0].val + "_batch"),),
-        args=[ast.ColumnRef((ast.String("batch"),))],
-    )
-    select_stmt.targetList = outer_target_list
+    select_stmt = ast.SelectStmt(targetList=unnest_target_list, fromClause=(subselect,))
+    select_stmt.targetList = unnest_target_list
     q[0].stmt = select_stmt
