@@ -204,23 +204,20 @@ class UdfRewriter:
         )
         block += (IndentedStream()(create_table_stmt) + ";").split("\n")
 
-        # INSERT INTO temp SELECT unnest(param1_batch), unnest(param2_batch), ...
+        # INSERT INTO temp SELECT * FROM UNNEST(param1, param2, ...);
         insert_stmt = ast.InsertStmt(
             relation=ast.RangeVar(relname="temp", inh=True, relpersistence="p"),
             selectStmt=ast.SelectStmt(
-                targetList=[
-                    ast.ResTarget(
-                        val=ast.FuncCall(
-                            funcname=[ast.String("unnest")],
-                            args=[
-                                ast.ColumnRef(
-                                    fields=[ast.String(param.name + "_batch")]
-                                )
-                                for param in self.params
-                            ],
-                        )
+                targetList=[ast.A_Star()],
+                fromClause=[
+                    ast.FuncCall(
+                        funcname=[ast.String("unnest")],
+                        args=[
+                            ast.ColumnRef(fields=[ast.String(param.name + "_batch")])
+                            for param in self.params
+                        ],
                     )
-                ]
+                ],
             ),
         )
         block += (IndentedStream()(insert_stmt) + ";").split("\n")
@@ -395,7 +392,7 @@ class UdfRewriter:
         # Change the return type to an array
         self.sql_tree.returnType.arrayBounds = [ast.Integer(-1)]
 
-        # TODO(kai): We don't want to accidentally replace an existing function,
+        # TODO(kai): We don't want to accidentally overwrite an existing function,
         # but for now we'll just replace it.
         self.sql_tree.replace = True
 
