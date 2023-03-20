@@ -18,7 +18,7 @@ def convertFunctionHeader(f: ast.CreateFunctionStmt):
     f.returnType.names = tuple(returnTypeList)
 
 
-def getFunctionCalls(parseTree):
+def getFunctionCalls(parseTree, udf_name):
     """
     Removes all function calls from the query,
     returning the list of function calls removed.
@@ -30,7 +30,8 @@ def getFunctionCalls(parseTree):
         function_calls = []
 
         def visit_FuncCall(self, parent, node):
-            self.function_calls.append(node)
+            if node.funcname[0].val == udf_name:
+                self.function_calls.append(node)
 
     visitor = FunctionCallAccumulator()
     visitor(parseTree)
@@ -107,7 +108,7 @@ def getUniqueColRefs(col_refs: List[ast.ColumnRef]):
     return unique_col_refs
 
 
-def transformQuery(q):
+def transformQuery(q, udf_name):
     """
     Transforms a query into a batched form
     :param q:
@@ -116,7 +117,7 @@ def transformQuery(q):
     subquery = q[0].stmt
     q[0].stmt = convertToSubquery(subquery)
     select_stmt = q[0].stmt
-    fn_calls = getFunctionCalls(q)
+    fn_calls = getFunctionCalls(q, udf_name)
     col_refs = []
     print(fn_calls)
     assert len(fn_calls) == 1
