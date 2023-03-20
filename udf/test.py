@@ -1,5 +1,4 @@
-from query_rewriter import *
-from udf_rewriter import *
+from rewriter import Rewriter
 import sys
 
 query_input_dir = sys.argv[1]
@@ -16,13 +15,11 @@ def rewrite_query(query_file_name, udf_file_name, output_file_name):
         query = query_file.read()
     with open(udf_file_name, "r") as udf_file:
         udf = udf_file.read()
-    root_q = parse_sql(query)
-    transformQuery(root_q)
-    rewriter = UdfRewriter(udf)
+    r = Rewriter(query, udf)
     with open(output_file_name, "w") as out_file:
-        out_file.write(rewriter.output())
+        out_file.write(r.new_udf())
         out_file.write("\n\n\n")
-        out_file.write(IndentedStream()(root_q))
+        out_file.write(r.new_query())
 
 
 for file in files:
