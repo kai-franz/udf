@@ -395,8 +395,9 @@ class UdfRewriter:
         # Change the return type to an array
         self.sql_tree.returnType.arrayBounds = [ast.Integer(-1)]
 
-        # We don't want to accidentally replace an existing function
-        self.sql_tree.replace = False
+        # TODO(kai): We don't want to accidentally replace an existing function,
+        # but for now we'll just replace it.
+        self.sql_tree.replace = True
 
         # Change the function name
         self.original_func_name = self.sql_tree.funcname[0].val
