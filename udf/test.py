@@ -1,3 +1,9 @@
+# Given a directory containing SQL queries and another directory containing the corresponding UDFs,
+# this script will rewrite the UDFs to use batched execution and rewrite the queries to use the new UDFs.
+# The rewritten queries and UDFs will be written to the output directory.
+#
+# Usage: python test.py <query_input_dir> <udf_input_dir> <output_dir>
+
 from rewriter import Rewriter
 import sys
 
