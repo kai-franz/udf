@@ -1,3 +1,4 @@
+import copy
 from typing import List
 from pglast import ast
 from pglast.enums import SortByNulls, SortByDir
@@ -38,8 +39,8 @@ def getFunctionCalls(parseTree):
 
 def convertToSubquery(q: ast.SelectStmt):
     """
-    Converts a query of the form (SELECT c1, c2, c3, ...) into
-    (SELECT c1, c2, c3 FROM (SELECT * ...) as dt1)
+    Converts a query of the form (SELECT c1, c2, c3 FROM ...) into
+    (SELECT c1, c2, c3 FROM (SELECT c1, c2, c3 FROM ...) as dt1)
     :param q: the query to convert
     :return: the modified query, as a SelectStmt
     """
@@ -112,10 +113,12 @@ def transformQuery(q):
     :param q:
     :return:
     """
-    q[0].stmt = convertToSubquery(q[0].stmt)
+    subquery = q[0].stmt
+    q[0].stmt = convertToSubquery(subquery)
     select_stmt = q[0].stmt
     fn_calls = getFunctionCalls(q)
     col_refs = []
+    print(fn_calls)
     assert len(fn_calls) == 1
     fn_call = fn_calls[0]
     for arg in fn_call.args:
@@ -128,12 +131,25 @@ def transformQuery(q):
     col_refs = getUniqueColRefs(col_refs)
     outer_target_list = select_stmt.targetList
     select_stmt.targetList = new_array_agg(col_refs)
+
+    # TODO(kai): make sure these are all the columns we need from the inner query
+    inner_target_list = [
+        target
+        for target in copy.deepcopy(outer_target_list)
+        if isinstance(target.val, ast.ColumnRef)
+    ]
     for target in outer_target_list:
         val = target.val
         if isinstance(val, ast.FuncCall):
             val.funcname = [ast.String(val.funcname[0].val + "_batch")]
             val.args = [
-                ast.ColumnRef([ast.String(arg.fields[0].val + "_batch")])
+                ast.ColumnRef(
+                    [
+                        ast.String(arg.fields[0].val + "_batch")
+                        if isinstance(arg, ast.ColumnRef)
+                        else arg
+                    ]
+                )
                 for arg in val.args
             ]
             unnest_call = ast.FuncCall(funcname=[ast.String("unnest")], args=[val])
@@ -145,7 +161,7 @@ def transformQuery(q):
                     args=[ast.ColumnRef([ast.String(val.fields[0].val + "_batch")])],
                 )
             ]
-
+    subquery.targetList = inner_target_list
     # push down the select statement into a subquery
     subselect = ast.RangeSubselect(
         lateral=False, subquery=select_stmt, alias=ast.Alias("dt2")
@@ -155,9 +171,6 @@ def transformQuery(q):
     batched_func_call = ast.FuncCall(
         funcname=(ast.String(fn_call.funcname[0].val + "_batch"),),
         args=[ast.ColumnRef((ast.String("batch"),))],
-    )
-    indirection_target = ast.A_Indirection(
-        arg=batched_func_call, indirection=(ast.A_Star(),)
     )
     select_stmt.targetList = outer_target_list
     q[0].stmt = select_stmt
