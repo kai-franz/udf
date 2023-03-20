@@ -12,6 +12,7 @@ class BaseType(Enum):
     INT = 1
     DECIMAL = 2
     FLOAT = 3
+    VARCHAR = 4
     # handle cases like DECIMAL(10, 2)
 
 
@@ -398,4 +399,5 @@ class UdfRewriter:
         self.sql_tree.replace = False
 
         # Change the function name
+        self.original_func_name = self.sql_tree.funcname[0].val
         self.sql_tree.funcname = [ast.String(self.sql_tree.funcname[0].val + "_batch")]
