@@ -125,7 +125,7 @@ class Node:
             isinstance(child_ast, ast.SelectStmt)
             and child_ast.op == SetOperation.SETOP_NONE
         ):
-            # If the child is already a non-steop select statement, we can just return it.
+            # If the child is already a non-setop select statement, we can just return it.
             return child_ast
         if isinstance(child_ast, ast.SelectStmt):
             # Handle the case where the child is a set operation.
@@ -201,8 +201,10 @@ class SetOp(Node):
     def deparse(self):
         left_ast = self.construct_subselect(self.left().deparse())
         right_ast = self.construct_subselect(self.right().deparse())
-        left_ast.targetList = None
-        right_ast.targetList = None
+        if len(left_ast.targetList) == 0:
+            left_ast.targetList = None
+        if len(right_ast.targetList) == 0:
+            right_ast.targetList = None
 
         return ast.SelectStmt(
             op=self.type.to_setop(),
