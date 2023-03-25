@@ -34,6 +34,7 @@ class NodeType(Enum):
     JOIN = auto()
     DEPENDENT_JOIN = auto()
     ORDER_BY = auto()
+    LIMIT = auto()
     RESULT = auto()
 
     def camel_case_name(self):
@@ -48,6 +49,7 @@ class Ordering:
     HAVING = 3
     PROJECT = 4
     ORDER_BY = 5
+    LIMIT = 6
 
     @staticmethod
     def can_coalesce(parent_order: int, child_order: int):
@@ -113,7 +115,7 @@ class Node:
                     ast.ResTarget(val=ast.ColumnRef((ast.A_Star(),)))
                 ]
             return ast.SelectStmt(
-                targetList=[ast.ResTarget(val=ast.ColumnRef((ast.A_Star(),)))],
+                targetList=[],
                 op=SetOperation.SETOP_NONE,
                 fromClause=[
                     ast.RangeSubselect(
@@ -212,16 +214,17 @@ class DependentJoin(Node):
 
 
 class Agg(Node):
-    def __init__(self, exprs, child):
+    def __init__(self, group_clause, child):
         super().__init__(type=NodeType.AGG)
-        self.exprs = exprs
+        self.group_clause = group_clause
         self.children.append(child)
 
     def deparse(self):
         parent_ast = self.rewrite_child_if_needed(
             self.child().deparse(), self.child().get_order()
         )
-        parent_ast.targetList = [ast.ResTarget(val=expr) for expr in self.exprs]
+        parent_ast = self.construct_subselect(parent_ast)
+        parent_ast.groupClause = self.group_clause
         return parent_ast
 
 
@@ -240,6 +243,25 @@ class OrderBy(Node):
         return parent_ast
 
 
+class Limit(Node):
+    def __init__(self, select_stmt, child):
+        super().__init__(type=NodeType.LIMIT)
+        self.limit_count = select_stmt.limitCount
+        self.limit_offset = select_stmt.limitOffset
+        self.limit_option = select_stmt.limitOption
+        self.children.append(child)
+
+    def deparse(self):
+        parent_ast = self.rewrite_child_if_needed(
+            self.child().deparse(), self.child().get_order()
+        )
+        parent_ast = self.construct_subselect(parent_ast)
+        parent_ast.limitCount = self.limit_count
+        parent_ast.limitOffset = self.limit_offset
+        parent_ast.limitOption = self.limit_option
+        return parent_ast
+
+
 class Result(Node):
     def __init__(self, child):
         super().__init__(type=NodeType.RESULT)
@@ -247,7 +269,7 @@ class Result(Node):
 
     def deparse(self):
         ast = self.child().deparse()
-        print(ast)
+        # print(ast)
         return ast
 
 
@@ -310,6 +332,10 @@ class Planner:
         if select_stmt.sortClause is not None:
             node = OrderBy(select_stmt.sortClause, node)
 
+        # LIMIT
+        if select_stmt.limitCount is not None:
+            node = Limit(select_stmt, node)
+
         return node
 
     @staticmethod
@@ -327,8 +353,7 @@ class Planner:
 
 
 if __name__ == "__main__":
-    plan = Planner.plan_query(
-        """SELECT ws_item_sk
+    query = """SELECT ws_item_sk
 FROM (SELECT ws_item_sk
            , count(*) AS cnt
       FROM web_sales
@@ -336,7 +361,9 @@ FROM (SELECT ws_item_sk
       ORDER BY cnt
       LIMIT 25000) AS t1
 WHERE getmanufact_simple(ws_item_sk) = 'oughtn st';"""
-    )
+    print(parse_sql(query))
+    plan = Planner.plan_query(query)
+
     deparsed_ast = plan.deparse()
     print(deparsed_ast)
     print(IndentedStream()(deparsed_ast))
