@@ -1,9 +1,9 @@
 from collections import defaultdict
-from enum import Enum
-
+from enum import Enum, IntEnum, auto
 from pglast import ast, parse_sql
+from pglast.enums import JoinType, SetOperation
+from pglast.stream import IndentedStream
 import pydot
-from pglast.enums import JoinType
 
 AGG_FUNCS = {
     "array_agg",
@@ -27,14 +27,14 @@ AGG_FUNCS = {
 
 class NodeType(Enum):
     TABLE_SCAN = 0
-    FILTER = 1
-    AGG = 2
-    HAVING = 3
-    PROJECT = 4
-    JOIN = 5
-    DEPENDENT_JOIN = 6
-    ORDER_BY = 7
-    RESULT = 8
+    FILTER = auto()
+    AGG = auto()
+    HAVING = auto()
+    PROJECT = auto()
+    JOIN = auto()
+    DEPENDENT_JOIN = auto()
+    ORDER_BY = auto()
+    RESULT = auto()
 
     def camel_case_name(self):
         return "".join([w.capitalize() for w in self.name.split("_")])
@@ -51,18 +51,16 @@ class Ordering:
 
     @staticmethod
     def can_coalesce(parent_order: int, child_order: int):
-        return parent_order <= child_order
-
-    @staticmethod
-    def get_order(node_type: NodeType):
-        return getattr(Ordering, node_type.name)
+        return parent_order >= child_order
 
 
 class Node:
     next_ids = defaultdict(int)
+    derived_table_count = 0
 
     def __init__(self, type: NodeType):
         self.children = []
+        self.type = type
         if type != NodeType.TABLE_SCAN:
             self.id = Node.next_id(Node.next_ids[type.name])
             Node.next_ids[type.name] += 1
@@ -90,6 +88,45 @@ class Node:
     def right(self):
         return self.children[1]
 
+    @staticmethod
+    def next_derived_table():
+        Node.derived_table_count += 1
+        return f"t{Node.derived_table_count}"
+
+    def construct_subselect(self, child_ast) -> ast.SelectStmt:
+        if isinstance(child_ast, ast.SelectStmt):
+            return child_ast
+        return ast.SelectStmt(
+            targetList=[],
+            op=SetOperation.SETOP_NONE,
+            fromClause=[child_ast],
+        )
+
+    def rewrite_child_if_needed(self, child_ast, child_order: int):
+        parent_order = self.get_order()
+        if Ordering.can_coalesce(parent_order, child_order):
+            return child_ast
+        else:
+            if not isinstance(child_ast, ast.SelectStmt):
+                child_ast = self.construct_subselect(child_ast)
+                child_ast.targetList = [
+                    ast.ResTarget(val=ast.ColumnRef((ast.A_Star(),)))
+                ]
+            return ast.SelectStmt(
+                targetList=[ast.ResTarget(val=ast.ColumnRef((ast.A_Star(),)))],
+                op=SetOperation.SETOP_NONE,
+                fromClause=[
+                    ast.RangeSubselect(
+                        lateral=False,
+                        subquery=child_ast,
+                        alias=ast.Alias(Node.next_derived_table()),
+                    )
+                ],
+            )
+
+    def get_order(self):
+        return getattr(Ordering, self.type.name)
+
 
 class TableScan(Node):
     def __init__(self, ast_node: ast.RangeVar):
@@ -108,12 +145,38 @@ class Filter(Node):
         self.predicate = predicate
         self.children.append(child)
 
+    def deparse(self):
+        child_ast = self.rewrite_child_if_needed(
+            self.child().deparse(), self.child().get_order()
+        )
+
+        child_ast = self.construct_subselect(child_ast)
+
+        if child_ast.whereClause is None:
+            child_ast.whereClause = []
+        child_ast.whereClause = self.predicate
+        return child_ast
+
 
 class Project(Node):
     def __init__(self, exprs, child):
         super().__init__(type=NodeType.PROJECT)
         self.exprs = exprs
-        self.children.append(child)
+        if child is not None:
+            self.children.append(child)
+
+    def deparse(self):
+        if len(self.children) == 0:
+            # SELECT without FROM clause
+            return ast.SelectStmt(
+                targetList=self.exprs,
+                op=SetOperation.SETOP_NONE,
+                fromClause=None,
+            )
+        child_ast = self.child().deparse()
+        parent_ast = self.construct_subselect(child_ast)
+        parent_ast.targetList = list(parent_ast.targetList) + list(self.exprs)
+        return parent_ast
 
 
 class Join(Node):
@@ -123,9 +186,13 @@ class Join(Node):
         self.children.append(left)
         self.children.append(right)
         if join_type is None:
-            self.join_type = JoinType.JOIN_INNER
-        else:
+            # Explicit join; infer join type from AST
             self.join_type = ast_node.jointype
+            self.quals = ast_node.quals
+        else:
+            # Implicit join; use join type provided by caller
+            self.join_type = JoinType.JOIN_INNER
+            self.quals = None
 
     def deparse(self):
         return ast.JoinExpr(
@@ -133,7 +200,7 @@ class Join(Node):
             larg=self.left().deparse(),
             rarg=self.right().deparse(),
             isNatural=False,
-            quals=self.ast_node.quals,
+            quals=self.quals,
         )
 
 
@@ -150,6 +217,13 @@ class Agg(Node):
         self.exprs = exprs
         self.children.append(child)
 
+    def deparse(self):
+        parent_ast = self.rewrite_child_if_needed(
+            self.child().deparse(), self.child().get_order()
+        )
+        parent_ast.targetList = [ast.ResTarget(val=expr) for expr in self.exprs]
+        return parent_ast
+
 
 class OrderBy(Node):
     def __init__(self, sort_clause, child):
@@ -157,11 +231,24 @@ class OrderBy(Node):
         self.sort_clause = sort_clause
         self.children.append(child)
 
+    def deparse(self):
+        parent_ast = self.rewrite_child_if_needed(
+            self.child().deparse(), self.child().get_order()
+        )
+        parent_ast = self.construct_subselect(parent_ast)
+        parent_ast.sortClause = self.sort_clause
+        return parent_ast
+
 
 class Result(Node):
     def __init__(self, child):
         super().__init__(type=NodeType.RESULT)
         self.children.append(child)
+
+    def deparse(self):
+        ast = self.child().deparse()
+        print(ast)
+        return ast
 
 
 class Planner:
@@ -171,13 +258,13 @@ class Planner:
     @staticmethod
     def plan_query(query_str: str):
         select_stmt = parse_sql(query_str)[0].stmt
-        print(select_stmt)
         result = Result(Planner.plan_select(select_stmt))
 
         # Visualization
         graph = pydot.Dot(graph_type="digraph")
         result.visualize(graph)
         graph.write_png("plan.png")
+        return result
 
     @staticmethod
     def plan_select(select_stmt: ast.SelectStmt):
@@ -191,13 +278,21 @@ class Planner:
             ]
 
         # JOIN
-        left_node = from_tables[0]
-        for right_node, right_ast in list(zip(from_tables, select_stmt.fromClause))[1:]:
-            if isinstance(right_ast, ast.RangeSubselect) and right_ast.lateral:
-                left_node = DependentJoin(left_node, right_node)
-            else:  # assume cross join, filter handled in WHERE
-                left_node = Join(right_ast, left_node, right_node, join_type="cross")
-        node = left_node
+        if len(from_tables) > 0:
+            left_node = from_tables[0]
+            for right_node, right_ast in list(zip(from_tables, select_stmt.fromClause))[
+                1:
+            ]:
+                if isinstance(right_ast, ast.RangeSubselect) and right_ast.lateral:
+                    left_node = DependentJoin(left_node, right_node)
+                else:  # assume cross join, filter handled in WHERE clause
+                    left_node = Join(
+                        right_ast, left_node, right_node, join_type=JoinType.JOIN_INNER
+                    )
+            node = left_node
+        else:
+            # No FROM clause
+            node = None
 
         # WHERE
         if select_stmt.whereClause is not None:
@@ -232,20 +327,16 @@ class Planner:
 
 
 if __name__ == "__main__":
-    #     Planner.plan_query(
-    #         """SELECT ca_state
-    #      , d_year
-    #      , d_qoy
-    #      , totallargepurchases(ca_state, 1000, d_year, d_qoy)
-    # FROM customer_address, date_dim
-    # WHERE d_year IN (1998, 1999, 2000)
-    #   AND ca_state IS NOT NULL
-    # GROUP BY ca_state, d_year, d_qoy
-    # ORDER BY ca_state
-    #        , d_year
-    #        , d_qoy;"""
-    #     )
-
-    Planner.plan_query(
-        """select * from customer inner join web_sales on customer.c_customer_sk = web_sales.ws_sold_date_sk;"""
+    plan = Planner.plan_query(
+        """SELECT ws_item_sk
+FROM (SELECT ws_item_sk
+           , count(*) AS cnt
+      FROM web_sales
+      GROUP BY ws_item_sk
+      ORDER BY cnt
+      LIMIT 25000) AS t1
+WHERE getmanufact_simple(ws_item_sk) = 'oughtn st';"""
     )
+    deparsed_ast = plan.deparse()
+    print(deparsed_ast)
+    print(IndentedStream()(deparsed_ast))
