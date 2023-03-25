@@ -27,6 +27,9 @@ AGG_FUNCS = {
 
 class NodeType(Enum):
     TABLE_SCAN = 0
+    UNION = auto()
+    INTERSECT = auto()
+    EXCEPT = auto()
     FILTER = auto()
     AGG = auto()
     HAVING = auto()
@@ -40,16 +43,38 @@ class NodeType(Enum):
     def camel_case_name(self):
         return "".join([w.capitalize() for w in self.name.split("_")])
 
+    @staticmethod
+    def from_setop(set_op: SetOperation):
+        if set_op == SetOperation.SETOP_UNION:
+            return NodeType.UNION
+        elif set_op == SetOperation.SETOP_INTERSECT:
+            return NodeType.INTERSECT
+        elif set_op == SetOperation.SETOP_EXCEPT:
+            return NodeType.EXCEPT
+        raise Exception("Unknown set operation")
+
+    def to_setop(self):
+        if self == NodeType.UNION:
+            return SetOperation.SETOP_UNION
+        elif self == NodeType.INTERSECT:
+            return SetOperation.SETOP_INTERSECT
+        elif self == NodeType.EXCEPT:
+            return SetOperation.SETOP_EXCEPT
+        raise Exception("Unknown set operation")
+
 
 class Ordering:
     TABLE_SCAN = 0
     JOIN = 0
-    FILTER = 1
-    AGG = 2
-    HAVING = 3
-    PROJECT = 4
-    ORDER_BY = 5
-    LIMIT = 6
+    UNION = 1
+    INTERSECT = 1
+    EXCEPT = 1
+    FILTER = 2
+    AGG = 3
+    HAVING = 4
+    PROJECT = 5
+    ORDER_BY = 6
+    LIMIT = 7
 
     @staticmethod
     def can_coalesce(parent_order: int, child_order: int):
@@ -57,23 +82,23 @@ class Ordering:
 
 
 class Node:
-    next_ids = defaultdict(int)
+    ids = defaultdict(int)
     derived_table_count = 0
 
     def __init__(self, type: NodeType):
         self.children = []
         self.type = type
         if type != NodeType.TABLE_SCAN:
-            self.id = Node.next_id(Node.next_ids[type.name])
-            Node.next_ids[type.name] += 1
+            self.id = Node.next_id(type.name)
+            Node.ids[type.name] += 1
             self.graph_node = pydot.Node(
                 type.name + "_" + str(self.id), label=type.camel_case_name()
             )
 
     @staticmethod
     def next_id(node_type):
-        Node.next_ids[node_type] += 1
-        return Node.next_ids[node_type]
+        Node.ids[node_type] += 1
+        return Node.ids[node_type]
 
     def visualize(self, graph: pydot.Dot):
         graph.add_node(self.graph_node)
@@ -96,12 +121,35 @@ class Node:
         return f"t{Node.derived_table_count}"
 
     def construct_subselect(self, child_ast) -> ast.SelectStmt:
-        if isinstance(child_ast, ast.SelectStmt):
+        if (
+            isinstance(child_ast, ast.SelectStmt)
+            and child_ast.op == SetOperation.SETOP_NONE
+        ):
+            # If the child is already a non-steop select statement, we can just return it.
             return child_ast
+        if isinstance(child_ast, ast.SelectStmt):
+            # Handle the case where the child is a set operation.
+            # Here, we need to wrap the child in a RangeSubselect, since it's going to
+            # be in the FROM clause.
+            child_ast = ast.RangeSubselect(
+                lateral=False,
+                subquery=child_ast,
+                alias=ast.Alias(Node.next_derived_table()),
+            )
         return ast.SelectStmt(
             targetList=[],
             op=SetOperation.SETOP_NONE,
             fromClause=[child_ast],
+        )
+
+    def construct_range_subselect(self, child_ast) -> ast.RangeSubselect:
+        subquery = self.construct_subselect(child_ast)
+        if subquery.targetList is not None and len(subquery.targetList) == 0:
+            subquery.targetList = None
+        return ast.RangeSubselect(
+            lateral=False,
+            subquery=subquery,
+            alias=ast.Alias(Node.next_derived_table()),
         )
 
     def rewrite_child_if_needed(self, child_ast, child_order: int):
@@ -114,6 +162,7 @@ class Node:
                 child_ast.targetList = [
                     ast.ResTarget(val=ast.ColumnRef((ast.A_Star(),)))
                 ]
+            assert child_ast.targetList is None or len(child_ast.targetList) > 0
             return ast.SelectStmt(
                 targetList=[],
                 op=SetOperation.SETOP_NONE,
@@ -139,6 +188,30 @@ class TableScan(Node):
 
     def deparse(self):
         return self.ast_node
+
+
+class SetOp(Node):
+    def __init__(self, ast_node: ast.SelectStmt, left: Node, right: Node):
+        super().__init__(NodeType.from_setop(ast_node.op))
+        self.ast_node = ast_node
+        self.all = ast_node.all
+        self.children.append(left)
+        self.children.append(right)
+
+    def deparse(self):
+        left_ast = self.construct_subselect(self.left().deparse())
+        right_ast = self.construct_subselect(self.right().deparse())
+        left_ast.targetList = None
+        right_ast.targetList = None
+
+        return ast.SelectStmt(
+            op=self.type.to_setop(),
+            all=self.all,
+            larg=left_ast,
+            rarg=right_ast,
+            targetList=None,
+            fromClause=None,
+        )
 
 
 class Filter(Node):
@@ -289,7 +362,11 @@ class Planner:
         return result
 
     @staticmethod
-    def plan_select(select_stmt: ast.SelectStmt):
+    def plan_select(select_stmt: ast.SelectStmt) -> Node:
+        if select_stmt.op != SetOperation.SETOP_NONE:
+            left = Planner.plan_select(select_stmt.larg)
+            right = Planner.plan_select(select_stmt.rarg)
+            return SetOp(select_stmt, left, right)
         # 1. FROM
         if select_stmt.fromClause is None:
             from_tables = []
@@ -353,15 +430,36 @@ class Planner:
 
 
 if __name__ == "__main__":
-    query = """SELECT ws_item_sk
-FROM (SELECT ws_item_sk
-           , count(*) AS cnt
-      FROM web_sales
-      GROUP BY ws_item_sk
-      ORDER BY cnt
-      LIMIT 25000) AS t1
-WHERE getmanufact_simple(ws_item_sk) = 'oughtn st';"""
+
+    query = """SELECT maxsolditem
+  FROM (SELECT ss_item_sk AS maxsolditem
+          FROM (SELECT ss_item_sk
+                     , SUM(cnt) AS totalcnt
+                  FROM ((SELECT ss_item_sk
+                              , COUNT(*) AS cnt
+                           FROM store_sales_history
+                          GROUP BY ss_item_sk
+
+                          UNION ALL
+
+                         SELECT cs_item_sk
+                              , COUNT(*) AS cnt
+                           FROM catalog_sales_history
+                          GROUP BY cs_item_sk)
+
+                   UNION ALL
+
+                  SELECT ws_item_sk
+                       , COUNT(*) AS cnt
+                    FROM web_sales_history
+                   GROUP BY ws_item_sk) AS t1
+                 GROUP BY ss_item_sk) AS t2
+         ORDER BY totalcnt DESC
+         LIMIT 25000) AS t3
+ WHERE getmanufact_complex(maxsolditem) = 'oughtn st';"""
+
     print(parse_sql(query))
+    print(IndentedStream()(parse_sql(query)[0].stmt))
     plan = Planner.plan_query(query)
 
     deparsed_ast = plan.deparse()
