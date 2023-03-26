@@ -4,7 +4,7 @@ from pglast import ast, parse_sql
 from pglast.enums import JoinType, SetOperation
 from pglast.stream import IndentedStream
 import pydot
-from pglast.visitors import Visitor
+from pglast.visitors import Visitor, Skip
 
 AGG_FUNCS = {
     "array_agg",
@@ -33,6 +33,9 @@ class AggFinder(Visitor):
     def visit_FuncCall(self, parent, node: ast.FuncCall):
         if node.funcname and node.funcname[-1].val in AGG_FUNCS:
             self.has_agg = True
+
+    def visit_SelectStmt(self, parent, node: ast.SelectStmt):
+        return Skip
 
 
 class NodeType(Enum):
