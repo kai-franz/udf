@@ -4,6 +4,7 @@ from pglast import ast, parse_sql
 from pglast.enums import JoinType, SetOperation
 from pglast.stream import IndentedStream
 import pydot
+from pglast.visitors import Visitor
 
 AGG_FUNCS = {
     "array_agg",
@@ -23,6 +24,15 @@ AGG_FUNCS = {
     "sum",
     "xmlagg",
 }
+
+
+class AggFinder(Visitor):
+    def __init__(self):
+        self.has_agg = False
+
+    def visit_FuncCall(self, parent, node: ast.FuncCall):
+        if node.funcname and node.funcname[-1].val in AGG_FUNCS:
+            self.has_agg = True
 
 
 class NodeType(Enum):
@@ -78,7 +88,9 @@ class Ordering:
 
     @staticmethod
     def can_coalesce(parent_order: int, child_order: int):
-        return parent_order >= child_order
+        return parent_order > child_order or (
+            parent_order == child_order and parent_order != Ordering.AGG
+        )
 
 
 class Node:
@@ -121,12 +133,53 @@ class Node:
         return f"t{Node.derived_table_count}"
 
     def construct_subselect(self, child_ast) -> ast.SelectStmt:
+        """
+        Takes in an AST, and constructs a SelectStmt that wraps it.
+        If the AST is already a SelectStmt, it will be returned as-is,
+        unless it is a set operation, in which case it will still be
+        wrapped in a SelectStmt.
+        :param child_ast:
+        :return:
+        """
         if (
             isinstance(child_ast, ast.SelectStmt)
             and child_ast.op == SetOperation.SETOP_NONE
         ):
             # If the child is already a non-setop select statement, we can just return it.
             return child_ast
+        if isinstance(child_ast, ast.SelectStmt):
+            # Handle the case where the child is a set operation.
+            # Here, we need to wrap the child in a RangeSubselect, since it's going to
+            # be in the FROM clause.
+            child_ast = ast.RangeSubselect(
+                lateral=False,
+                subquery=child_ast,
+                alias=ast.Alias(Node.next_derived_table()),
+            )
+        return ast.SelectStmt(
+            targetList=[],
+            op=SetOperation.SETOP_NONE,
+            fromClause=[child_ast],
+        )
+
+    def construct_subselect_if_needed(self, child_ast) -> ast.SelectStmt:
+        """
+        Takes in an AST, and constructs a SelectStmt that wraps it.
+        If the AST is already a SelectStmt, it will be returned as-is,
+        even if it is a set operation.
+        :param child_ast:
+        :return:
+        """
+        if isinstance(child_ast, ast.SelectStmt):
+            # If the child is already a select statement, we can just return it.
+            return child_ast
+        return ast.SelectStmt(
+            targetList=[],
+            op=SetOperation.SETOP_NONE,
+            fromClause=[child_ast],
+        )
+
+    def force_construct_subselect(self, child_ast) -> ast.SelectStmt:
         if isinstance(child_ast, ast.SelectStmt):
             # Handle the case where the child is a set operation.
             # Here, we need to wrap the child in a RangeSubselect, since it's going to
@@ -199,13 +252,10 @@ class SetOp(Node):
         self.children.append(right)
 
     def deparse(self):
-        left_ast = self.construct_subselect(self.left().deparse())
-        right_ast = self.construct_subselect(self.right().deparse())
-        if len(left_ast.targetList) == 0:
-            left_ast.targetList = None
-        if len(right_ast.targetList) == 0:
-            right_ast.targetList = None
-
+        child_asts = [child.deparse() for child in self.children]
+        child_asts = [self.construct_subselect_if_needed(ast) for ast in child_asts]
+        left_ast = child_asts[0]
+        right_ast = child_asts[1]
         return ast.SelectStmt(
             op=self.type.to_setop(),
             all=self.all,
@@ -226,7 +276,6 @@ class Filter(Node):
         child_ast = self.rewrite_child_if_needed(
             self.child().deparse(), self.child().get_order()
         )
-
         child_ast = self.construct_subselect(child_ast)
 
         if child_ast.whereClause is None:
@@ -251,9 +300,18 @@ class Project(Node):
                 fromClause=None,
             )
         child_ast = self.child().deparse()
-        parent_ast = self.construct_subselect(child_ast)
-        parent_ast.targetList = list(parent_ast.targetList) + list(self.exprs)
-        return parent_ast
+        print("child_ast: ", child_ast)
+        # For now, I've decided to always wrap the child in a subselect
+        # for project nodes.
+        child_ast = self.construct_subselect(child_ast)
+        if (
+            child_ast.targetList is None
+            and len(child_ast.targetList) > 0
+            or self.child().get_order() == Ordering.PROJECT
+        ):
+            child_ast = self.force_construct_subselect(child_ast)
+        child_ast.targetList = list(child_ast.targetList) + list(self.exprs)
+        return child_ast
 
 
 class Join(Node):
@@ -289,9 +347,19 @@ class DependentJoin(Node):
 
 
 class Agg(Node):
-    def __init__(self, group_clause, child):
+    def __init__(self, target_list, group_clause, agg_targets, child):
         super().__init__(type=NodeType.AGG)
         self.group_clause = group_clause
+        self.agg_keys = [
+            target for target, has_agg in zip(target_list, agg_targets) if not has_agg
+        ]
+        self.agg_values = [
+            target for target, has_agg in zip(target_list, agg_targets) if has_agg
+        ]
+        if len(self.agg_keys) == 0:
+            assert group_clause is None
+            self.agg_keys = None
+        self.target_list = target_list
         self.children.append(child)
 
     def deparse(self):
@@ -299,7 +367,8 @@ class Agg(Node):
             self.child().deparse(), self.child().get_order()
         )
         parent_ast = self.construct_subselect(parent_ast)
-        parent_ast.groupClause = self.group_clause
+        parent_ast.groupClause = self.agg_keys
+        parent_ast.targetList = self.target_list
         return parent_ast
 
 
@@ -400,12 +469,22 @@ class Planner:
             node = Filter(select_stmt.whereClause, node)
 
         # GROUP BY / Scalar aggregate
-        if select_stmt.groupClause is not None:
-            node = Agg(select_stmt.groupClause, node)
+        agg_targets = []
+        for target in select_stmt.targetList:
+            agg_finder = AggFinder()
+            agg_finder(target)
+            agg_targets.append(agg_finder.has_agg)
 
-        # SELECT
-        assert select_stmt.targetList is not None and len(select_stmt.targetList) > 0
-        node = Project(select_stmt.targetList, node)
+        if select_stmt.groupClause is not None or any(agg_targets):
+            node = Agg(
+                select_stmt.targetList, select_stmt.groupClause, agg_targets, node
+            )
+        else:
+            # SELECT
+            assert (
+                select_stmt.targetList is not None and len(select_stmt.targetList) > 0
+            )
+            node = Project(select_stmt.targetList, node)
 
         # ORDER BY
         if select_stmt.sortClause is not None:
@@ -459,6 +538,41 @@ if __name__ == "__main__":
          ORDER BY totalcnt DESC
          LIMIT 25000) AS t3
  WHERE getmanufact_complex(maxsolditem) = 'oughtn st';"""
+
+    query = """SELECT ss_item_sk AS maxsolditem
+  FROM (SELECT ss_item_sk
+             , SUM(cnt) AS totalcnt
+          FROM ((SELECT ss_item_sk
+                      , COUNT(*) AS cnt
+                   FROM store_sales_history
+                  GROUP BY ss_item_sk
+
+                  UNION ALL
+
+                 SELECT cs_item_sk
+                      , COUNT(*) AS cnt
+                   FROM catalog_sales_history
+                  GROUP BY cs_item_sk)
+
+           UNION ALL
+
+          SELECT ws_item_sk
+               , COUNT(*) AS cnt
+            FROM web_sales_history
+           GROUP BY ws_item_sk) AS t1
+         GROUP BY ss_item_sk) AS t2
+ ORDER BY totalcnt DESC
+ LIMIT 25000;"""
+
+    query = """SELECT c_customer_sk
+     , maxpurchasechannel(c_customer_sk
+    , (SELECT MIN(d_date_sk)
+         FROM date_dim
+        WHERE d_year = 2000)
+    , (SELECT MAX(d_date_sk)
+         FROM date_dim
+        WHERE d_year = 2020)) AS channel
+  FROM customer;"""
 
     print(parse_sql(query))
     print(IndentedStream()(parse_sql(query)[0].stmt))
