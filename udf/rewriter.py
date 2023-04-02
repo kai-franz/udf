@@ -6,9 +6,10 @@ class Rewriter:
     def __init__(self, query, udf):
         self.query = query
         self.udf = udf
+        self.schema = Schema()
 
         # Do the rewrites
-        self.udf_rewriter = UdfRewriter(udf)
+        self.udf_rewriter = UdfRewriter(udf, self.schema)
         self.root_q = parse_sql(query)
         transformQuery(self.root_q, self.udf_rewriter.original_func_name)
 

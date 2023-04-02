@@ -3,8 +3,10 @@ from enum import Enum, IntEnum, auto
 from pglast import ast, parse_sql
 from pglast.enums import JoinType, SetOperation
 from pglast.stream import IndentedStream
-import pydot
 from pglast.visitors import Visitor, Skip
+import pydot
+
+from udf.schema import Schema
 
 AGG_FUNCS = {
     "array_agg",
@@ -451,13 +453,12 @@ class Result(Node):
 
 
 class Planner:
-    def __init__(self):
-        pass
+    def __init__(self, schema: Schema):
+        self.schema = schema
 
-    @staticmethod
-    def plan_query(query_str: str):
+    def plan_query(self, query_str: str):
         select_stmt = parse_sql(query_str)[0].stmt
-        result = Result(Planner.plan_select(select_stmt), into=select_stmt.intoClause)
+        result = Result(self.plan_select(select_stmt), into=select_stmt.intoClause)
 
         # Visualization
         graph = pydot.Dot(graph_type="digraph")
@@ -465,19 +466,17 @@ class Planner:
         graph.write_png("plan.png")
         return result
 
-    @staticmethod
-    def plan_select(select_stmt: ast.SelectStmt) -> Node:
+    def plan_select(self, select_stmt: ast.SelectStmt) -> Node:
         if select_stmt.op != SetOperation.SETOP_NONE:
-            left = Planner.plan_select(select_stmt.larg)
-            right = Planner.plan_select(select_stmt.rarg)
+            left = self.plan_select(select_stmt.larg)
+            right = self.plan_select(select_stmt.rarg)
             return SetOp(select_stmt, left, right)
         # 1. FROM
         if select_stmt.fromClause is None:
             from_tables = []
         else:
             from_tables = [
-                Planner.plan_from_node(from_entry)
-                for from_entry in select_stmt.fromClause
+                self.plan_from_node(from_entry) for from_entry in select_stmt.fromClause
             ]
 
         # JOIN
@@ -529,15 +528,14 @@ class Planner:
 
         return node
 
-    @staticmethod
-    def plan_from_node(from_node):
+    def plan_from_node(self, from_node):
         if isinstance(from_node, ast.RangeVar):
             return TableScan(from_node)
         elif isinstance(from_node, ast.RangeSubselect):
-            return Planner.plan_select(from_node.subquery)
+            return self.plan_select(from_node.subquery)
         elif isinstance(from_node, ast.JoinExpr):
-            left = Planner.plan_from_node(from_node.larg)
-            right = Planner.plan_from_node(from_node.rarg)
+            left = self.plan_from_node(from_node.larg)
+            right = self.plan_from_node(from_node.rarg)
             return Join(from_node, left, right)
         else:
             raise NotImplementedError
@@ -561,7 +559,10 @@ if __name__ == "__main__":
 
     print(parse_sql(query))
     print(IndentedStream()(parse_sql(query)[0].stmt))
-    plan = Planner.plan_query(query)
+    schema = Schema()
+    planner = Planner(schema)
+
+    plan = planner.plan_query(query)
     plan.remove_dependent_joins()
     deparsed_ast = plan.deparse()
     print(deparsed_ast)

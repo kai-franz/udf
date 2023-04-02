@@ -7,6 +7,8 @@ from pglast.stream import IndentedStream
 from pglast.visitors import Visitor
 from typing import List
 
+from udf.schema import Schema
+
 
 class BaseType(Enum):
     INT = 1
@@ -103,7 +105,7 @@ class FunctionBodyRewriter(Visitor):
 
 
 class UdfRewriter:
-    def __init__(self, f: str):
+    def __init__(self, f: str, schema: Schema):
         self.sql_tree = parse_sql(f)[0].stmt
         self.tree = parse_plpgsql(f)[0]["PLpgSQL_function"]
         self.vars = {}  # maps varnos to variable names
@@ -115,6 +117,7 @@ class UdfRewriter:
         self.rewrite_body()
         self.replace_function_body("\n".join(self.flatten_program(self.out)))
         self.output_sql = IndentedStream()(self.sql_tree) + ";"
+        self.schema = schema
 
     def output(self) -> str:
         return self.output_sql
@@ -202,6 +205,7 @@ class UdfRewriter:
             tableElts=temp_table_cols,
             oncommit=OnCommitAction.ONCOMMIT_DROP,
         )
+        self.schema.add_table_from_ast(create_table_stmt)
         block += (IndentedStream()(create_table_stmt) + ";").split("\n")
 
         # INSERT INTO temp SELECT * FROM UNNEST(param1, param2, ...);
@@ -385,6 +389,7 @@ class UdfRewriter:
         making scalar parameters into arrays.
         """
         for param in self.sql_tree.parameters:
+            print(param)
             param.argType = copy.copy(param.argType)
             param.argType.arrayBounds = [ast.Integer(-1)]
             param.name = param.name + "_batch"
