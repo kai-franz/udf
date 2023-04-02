@@ -234,6 +234,23 @@ class Node:
     def get_order(self):
         return getattr(Ordering, self.type.name)
 
+    def remove_dependent_joins(self):
+        if self.children is not None:
+            self.children = [child.remove_dependent_joins() for child in self.children]
+        return self
+
+
+class DependentJoin(Node):
+    def __init__(self, left, right):
+        super().__init__(type=NodeType.DEPENDENT_JOIN)
+        self.children.append(left)
+        self.children.append(right)
+
+    def remove_dependent_joins(self):
+        if self.children is not None:
+            self.children = [child.remove_dependent_joins() for child in self.children]
+        return self.children[1].push_down_dependent_join(self)
+
 
 class TableScan(Node):
     def __init__(self, ast_node: ast.RangeVar):
@@ -244,6 +261,12 @@ class TableScan(Node):
 
     def deparse(self):
         return self.ast_node
+
+    def push_down_dependent_join(self, join: DependentJoin):
+        ast_node = ast.JoinExpr(
+            jointype=JoinType.JOIN_LEFT, isNatural=False, larg=None, rarg=None
+        )
+        return Join(ast_node, join.child(), self, JoinType.JOIN_LEFT)
 
 
 class SetOp(Node):
@@ -286,6 +309,12 @@ class Filter(Node):
         child_ast.whereClause = self.predicate
         return child_ast
 
+    def push_down_dependent_join(self, join: DependentJoin):
+        self.children = [
+            child.push_down_dependent_join(join) for child in self.children
+        ]
+        return self
+
 
 class Project(Node):
     def __init__(self, exprs, child):
@@ -304,17 +333,23 @@ class Project(Node):
             )
         child_ast = self.child().deparse()
         print("child_ast: ", child_ast)
-        # For now, I've decided to always wrap the child in a subselect
+        # For now, we always wrap the child in a subselect
         # for project nodes.
         child_ast = self.construct_subselect(child_ast)
         if (
             child_ast.targetList is None
-            and len(child_ast.targetList) > 0
+            or len(child_ast.targetList) > 0
             or self.child().get_order() == Ordering.PROJECT
         ):
             child_ast = self.force_construct_subselect(child_ast)
         child_ast.targetList = list(child_ast.targetList) + list(self.exprs)
         return child_ast
+
+    def push_down_dependent_join(self, join: DependentJoin):
+        self.children = [
+            child.push_down_dependent_join(join) for child in self.children
+        ]
+        return self
 
 
 class Join(Node):
@@ -340,13 +375,6 @@ class Join(Node):
             isNatural=False,
             quals=self.quals,
         )
-
-
-class DependentJoin(Node):
-    def __init__(self, left, right):
-        super().__init__(type=NodeType.DEPENDENT_JOIN)
-        self.children.append(left)
-        self.children.append(right)
 
 
 class Agg(Node):
@@ -410,12 +438,14 @@ class Limit(Node):
 
 
 class Result(Node):
-    def __init__(self, child):
+    def __init__(self, child, into=None):
         super().__init__(type=NodeType.RESULT)
         self.children.append(child)
+        self.into = into
 
     def deparse(self):
         ast = self.child().deparse()
+        ast.intoClause = self.into
         # print(ast)
         return ast
 
@@ -427,7 +457,7 @@ class Planner:
     @staticmethod
     def plan_query(query_str: str):
         select_stmt = parse_sql(query_str)[0].stmt
-        result = Result(Planner.plan_select(select_stmt))
+        result = Result(Planner.plan_select(select_stmt), into=select_stmt.intoClause)
 
         # Visualization
         graph = pydot.Dot(graph_type="digraph")
@@ -515,72 +545,24 @@ class Planner:
 
 if __name__ == "__main__":
 
-    query = """SELECT maxsolditem
-  FROM (SELECT ss_item_sk AS maxsolditem
-          FROM (SELECT ss_item_sk
-                     , SUM(cnt) AS totalcnt
-                  FROM ((SELECT ss_item_sk
-                              , COUNT(*) AS cnt
-                           FROM store_sales_history
-                          GROUP BY ss_item_sk
+    #     query = """SELECT ca_state
+    #      , d_year
+    #      , d_qoy
+    #      , totallargepurchases(ca_state, 1000, d_year, d_qoy)
+    # FROM customer_address, date_dim
+    # WHERE d_year IN (1998, 1999, 2000)
+    #   AND ca_state IS NOT NULL
+    # GROUP BY ca_state, d_year, d_qoy
+    # ORDER BY ca_state
+    #        , d_year
+    #        , d_qoy;"""
 
-                          UNION ALL
-
-                         SELECT cs_item_sk
-                              , COUNT(*) AS cnt
-                           FROM catalog_sales_history
-                          GROUP BY cs_item_sk)
-
-                   UNION ALL
-
-                  SELECT ws_item_sk
-                       , COUNT(*) AS cnt
-                    FROM web_sales_history
-                   GROUP BY ws_item_sk) AS t1
-                 GROUP BY ss_item_sk) AS t2
-         ORDER BY totalcnt DESC
-         LIMIT 25000) AS t3
- WHERE getmanufact_complex(maxsolditem) = 'oughtn st';"""
-
-    query = """SELECT ss_item_sk AS maxsolditem
-  FROM (SELECT ss_item_sk
-             , SUM(cnt) AS totalcnt
-          FROM ((SELECT ss_item_sk
-                      , COUNT(*) AS cnt
-                   FROM store_sales_history
-                  GROUP BY ss_item_sk
-
-                  UNION ALL
-
-                 SELECT cs_item_sk
-                      , COUNT(*) AS cnt
-                   FROM catalog_sales_history
-                  GROUP BY cs_item_sk)
-
-           UNION ALL
-
-          SELECT ws_item_sk
-               , COUNT(*) AS cnt
-            FROM web_sales_history
-           GROUP BY ws_item_sk) AS t1
-         GROUP BY ss_item_sk) AS t2
- ORDER BY totalcnt DESC
- LIMIT 25000;"""
-
-    query = """SELECT c_customer_sk
-     , maxpurchasechannel(c_customer_sk
-    , (SELECT MIN(d_date_sk)
-         FROM date_dim
-        WHERE d_year = 2000)
-    , (SELECT MAX(d_date_sk)
-         FROM date_dim
-        WHERE d_year = 2020)) AS channel
-  FROM customer;"""
+    query = """SELECT * FROM t1, LATERAL (SELECT * FROM t2) dt1"""
 
     print(parse_sql(query))
     print(IndentedStream()(parse_sql(query)[0].stmt))
     plan = Planner.plan_query(query)
-
+    plan.remove_dependent_joins()
     deparsed_ast = plan.deparse()
     print(deparsed_ast)
     print(IndentedStream()(deparsed_ast))
