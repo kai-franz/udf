@@ -1,4 +1,4 @@
-from pglast import ast
+from pglast import ast, parse_sql
 
 
 class Schema:
@@ -6,8 +6,15 @@ class Schema:
     Represents the schema of the database.
     """
 
-    def __init__(self):
+    def __init__(self, schema_file):
         self.tables = {}
+        with open(schema_file, "r") as f:
+            schema_ast = parse_sql(f.read())
+        for raw_stmt in schema_ast:
+            stmt = raw_stmt.stmt
+            if not isinstance(stmt, ast.CreateStmt):
+                continue
+            self.add_table_from_ast(stmt)
 
     def add_table(self, name, cols: dict):
         self.tables[name] = cols
@@ -25,3 +32,8 @@ class Schema:
         for table in tables:
             columns = columns.union(self.tables[table].keys())
         return columns
+
+
+class ProcBenchSchema(Schema):
+    def __init__(self):
+        super().__init__("./tests/inputs/procbench_schema.sql")
