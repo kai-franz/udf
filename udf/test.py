@@ -11,7 +11,7 @@ query_input_dir = sys.argv[1]
 udf_input_dir = sys.argv[2]
 output_dir = sys.argv[3]
 
-udfs = [1, 5, 6, 7, 13]  # 12
+udfs = [1] # [1, 5, 6, 7, 13]  # 12
 files = [f"sudf_{udf}.sql" for udf in udfs]
 
 
