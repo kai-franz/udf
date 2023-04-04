@@ -6,7 +6,7 @@ from pglast.stream import IndentedStream
 from pglast.visitors import Visitor, Skip
 import pydot
 
-from udf.schema import Schema
+from udf.schema import Schema, ProcBenchSchema
 
 AGG_FUNCS = {
     "array_agg",
@@ -112,9 +112,10 @@ class Node:
     ids = defaultdict(int)
     derived_table_count = 0
 
-    def __init__(self, type: NodeType):
+    def __init__(self, schema: Schema, type: NodeType):
         self.children = []
         self.type = type
+        self.schema = schema
         if type != NodeType.TABLE_SCAN:
             self.id = Node.next_id(type.name)
             Node.ids[type.name] += 1
@@ -256,7 +257,7 @@ class Node:
 
 class DependentJoin(Node):
     def __init__(self, left: Node, right: Node, schema: Schema):
-        super().__init__(type=NodeType.DEPENDENT_JOIN)
+        super().__init__(schema, NodeType.DEPENDENT_JOIN)
         self.children.append(left)
         self.children.append(right)
         self.quals = []
@@ -271,8 +272,8 @@ class DependentJoin(Node):
 
 
 class TableScan(Node):
-    def __init__(self, ast_node: ast.RangeVar):
-        super().__init__(NodeType.TABLE_SCAN)
+    def __init__(self, schema: Schema, ast_node: ast.RangeVar):
+        super().__init__(schema, NodeType.TABLE_SCAN)
         self.ast_node = ast_node
         self.table = ast_node.relname
         self.graph_node = pydot.Node(self.table)
@@ -288,12 +289,14 @@ class TableScan(Node):
             rarg=None,
             quals=ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
         )
-        return Join(ast_node, join.left(), self)
+        return Join(self.schema, ast_node, join.left(), self)
 
 
 class SetOp(Node):
-    def __init__(self, ast_node: ast.SelectStmt, left: Node, right: Node):
-        super().__init__(NodeType.from_setop(ast_node.op))
+    def __init__(
+        self, schema: Schema, ast_node: ast.SelectStmt, left: Node, right: Node
+    ):
+        super().__init__(schema, NodeType.from_setop(ast_node.op))
         self.ast_node = ast_node
         self.all = ast_node.all
         self.children.append(left)
@@ -301,7 +304,9 @@ class SetOp(Node):
 
     def deparse(self):
         child_asts = [child.deparse() for child in self.children]
-        child_asts = [self.construct_subselect_if_needed(ast) for ast in child_asts]
+        child_asts = [
+            self.construct_subselect_if_needed(child_ast) for child_ast in child_asts
+        ]
         left_ast = child_asts[0]
         right_ast = child_asts[1]
         return ast.SelectStmt(
@@ -315,8 +320,8 @@ class SetOp(Node):
 
 
 class Filter(Node):
-    def __init__(self, predicate, child):
-        super().__init__(type=NodeType.FILTER)
+    def __init__(self, schema: Schema, predicate, child):
+        super().__init__(schema, type=NodeType.FILTER)
         self.predicate = predicate
         self.children.append(child)
 
@@ -345,8 +350,8 @@ class Filter(Node):
 
 
 class Project(Node):
-    def __init__(self, exprs, child):
-        super().__init__(type=NodeType.PROJECT)
+    def __init__(self, schema: Schema, exprs, child):
+        super().__init__(schema, NodeType.PROJECT)
         self.exprs = exprs
         if child is not None:
             self.children.append(child)
@@ -381,8 +386,10 @@ class Project(Node):
 
 
 class Join(Node):
-    def __init__(self, ast_node: ast.JoinExpr, left, right, join_type=None):
-        super().__init__(type=NodeType.JOIN)
+    def __init__(
+        self, schema: Schema, ast_node: ast.JoinExpr, left, right, join_type=None
+    ):
+        super().__init__(schema, NodeType.JOIN)
         self.ast_node = ast_node
         self.children.append(left)
         self.children.append(right)
@@ -412,8 +419,8 @@ class Join(Node):
 
 
 class Agg(Node):
-    def __init__(self, target_list, group_clause, agg_targets, child):
-        super().__init__(type=NodeType.AGG)
+    def __init__(self, schema: Schema, target_list, group_clause, agg_targets, child):
+        super().__init__(schema, NodeType.AGG)
         self.group_clause = group_clause
         self.agg_keys = [
             target for target, has_agg in zip(target_list, agg_targets) if not has_agg
@@ -451,8 +458,8 @@ class Agg(Node):
 
 
 class OrderBy(Node):
-    def __init__(self, sort_clause, child):
-        super().__init__(type=NodeType.ORDER_BY)
+    def __init__(self, schema: Schema, sort_clause, child):
+        super().__init__(schema, NodeType.ORDER_BY)
         self.sort_clause = sort_clause
         self.children.append(child)
 
@@ -466,8 +473,8 @@ class OrderBy(Node):
 
 
 class Limit(Node):
-    def __init__(self, select_stmt, child):
-        super().__init__(type=NodeType.LIMIT)
+    def __init__(self, schema: Schema, select_stmt, child):
+        super().__init__(schema, NodeType.LIMIT)
         self.limit_count = select_stmt.limitCount
         self.limit_offset = select_stmt.limitOffset
         self.limit_option = select_stmt.limitOption
@@ -485,16 +492,15 @@ class Limit(Node):
 
 
 class Result(Node):
-    def __init__(self, child, into=None):
-        super().__init__(type=NodeType.RESULT)
+    def __init__(self, schema: Schema, child, into=None):
+        super().__init__(schema, NodeType.RESULT)
         self.children.append(child)
         self.into = into
 
     def deparse(self):
-        ast = self.child().deparse()
-        ast.intoClause = self.into
-        # print(ast)
-        return ast
+        child_ast = self.child().deparse()
+        child_ast.intoClause = self.into
+        return child_ast
 
 
 class Planner:
@@ -508,7 +514,9 @@ class Planner:
 
     def plan_query(self, query_str: str):
         select_stmt = parse_sql(query_str)[0].stmt
-        result = Result(self.plan_select(select_stmt), into=select_stmt.intoClause)
+        result = Result(
+            self.schema, self.plan_select(select_stmt), into=select_stmt.intoClause
+        )
 
         # Visualization
         graph = pydot.Dot(graph_type="digraph")
@@ -539,7 +547,11 @@ class Planner:
                     left_node = DependentJoin(left_node, right_node, self.schema)
                 else:  # assume cross join, filter handled in WHERE clause
                     left_node = Join(
-                        right_ast, left_node, right_node, join_type=JoinType.JOIN_INNER
+                        self.schema,
+                        right_ast,
+                        left_node,
+                        right_node,
+                        join_type=JoinType.JOIN_INNER,
                     )
             node = left_node
         else:
@@ -552,10 +564,10 @@ class Planner:
             if isinstance(select_stmt.whereClause, ast.BoolExpr):
                 assert select_stmt.whereClause.boolop == BoolExprType.AND_EXPR
                 for qual in select_stmt.whereClause.args:
-                    node = Filter(qual, node)
+                    node = Filter(self.schema, qual, node)
             else:
                 assert isinstance(select_stmt.whereClause, ast.A_Expr)
-                node = Filter(select_stmt.whereClause, node)
+                node = Filter(self.schema, select_stmt.whereClause, node)
 
         # GROUP BY / Scalar aggregate
         agg_targets = []
@@ -566,34 +578,38 @@ class Planner:
 
         if select_stmt.groupClause is not None or any(agg_targets):
             node = Agg(
-                select_stmt.targetList, select_stmt.groupClause, agg_targets, node
+                self.schema,
+                select_stmt.targetList,
+                select_stmt.groupClause,
+                agg_targets,
+                node,
             )
         else:
             # SELECT
             assert (
                 select_stmt.targetList is not None and len(select_stmt.targetList) > 0
             )
-            node = Project(select_stmt.targetList, node)
+            node = Project(self.schema, select_stmt.targetList, node)
 
         # ORDER BY
         if select_stmt.sortClause is not None:
-            node = OrderBy(select_stmt.sortClause, node)
+            node = OrderBy(self.schema, select_stmt.sortClause, node)
 
         # LIMIT
         if select_stmt.limitCount is not None:
-            node = Limit(select_stmt, node)
+            node = Limit(self.schema, select_stmt, node)
 
         return node
 
     def plan_from_node(self, from_node):
         if isinstance(from_node, ast.RangeVar):
-            return TableScan(from_node)
+            return TableScan(self.schema, from_node)
         elif isinstance(from_node, ast.RangeSubselect):
             return self.plan_select(from_node.subquery)
         elif isinstance(from_node, ast.JoinExpr):
             left = self.plan_from_node(from_node.larg)
             right = self.plan_from_node(from_node.rarg)
-            return Join(from_node, left, right)
+            return Join(self.schema, from_node, left, right)
         else:
             raise NotImplementedError
 
@@ -625,7 +641,7 @@ if __name__ == "__main__":
 
     print(parse_sql(query))
     print(IndentedStream()(parse_sql(query)[0].stmt))
-    schema = Schema()
+    schema = ProcBenchSchema()
     # schema.add_table(
     #     "temp",
     #     {"manager": "varchar(40)", "yr": "int"},
