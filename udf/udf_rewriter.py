@@ -1,7 +1,7 @@
 import copy
 from enum import Enum
 from pglast import *
-from pglast import ast
+from pglast import ast, scan
 from pglast.enums import OnCommitAction
 from pglast.stream import IndentedStream
 from pglast.visitors import Visitor
@@ -104,6 +104,17 @@ class FunctionBodyRewriter(Visitor):
         if node.defname == "as":
             return ast.DefElem(defname="as", arg=(ast.String(self.new_body),))
 
+class FromClauseFinder(Visitor):
+    """
+    Finds the FROM clause in a query.
+    """
+
+    def __init__(self):
+        self.from_clause = False
+
+    def visit_SelectStmt(self, parent, node: ast.SelectStmt):
+        if node.fromClause:
+            self.from_clause = True
 
 class UdfRewriter:
     def __init__(self, f: str, schema: Schema, remove_laterals=False):
@@ -273,17 +284,14 @@ class UdfRewriter:
     def put_stmt(self, stmt, block):
         if "PLpgSQL_stmt_assign" in stmt:
             sql = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
+            print(stmt["PLpgSQL_stmt_assign"])
             lhs = self.vars[stmt["PLpgSQL_stmt_assign"]["varno"]]
-            rhs_ast = parse_sql(sql)
-            VarToArrayRefRewriter(self.get_local_var_names())(rhs_ast)
-            block.append(lhs.name + "[i] := (" + IndentedStream()(rhs_ast) + ");")
+            block.append(lhs.name + "[i] := (" + self.rewrite_query_inside_loop(sql) + ");")
         elif "PLpgSQL_stmt_execsql" in stmt:
             block.append(stmt["PLpgSQL_stmt_execsql"])
         elif "PLpgSQL_stmt_if" in stmt:
             sql = stmt["PLpgSQL_stmt_if"]["cond"]["PLpgSQL_expr"]["query"]
-            cond_ast = parse_sql(sql)
-            VarToArrayRefRewriter(self.get_local_var_names())(cond_ast)
-            block.append("IF (" + IndentedStream()(cond_ast) + ") THEN")
+            block.append("IF (" + self.rewrite_query_inside_loop(sql) + ") THEN")
             if "then_body" in stmt["PLpgSQL_stmt_if"]:
                 self.put_block(stmt["PLpgSQL_stmt_if"]["then_body"], block)
             if "else_body" in stmt["PLpgSQL_stmt_if"]:
@@ -300,12 +308,10 @@ class UdfRewriter:
                 return
 
             sql = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
-            rhs_ast = parse_sql(sql)
-            VarToArrayRefRewriter(self.get_local_var_names())(rhs_ast)
             block.append("IF returned[i] IS NULL THEN")
             block.append(
                 [
-                    "ret_vals[i] := (" + IndentedStream()(rhs_ast) + ");",
+                    "ret_vals[i] := (" + self.rewrite_query_inside_loop(sql) + ");",
                     "returned[i] := TRUE;",
                 ]
             )
@@ -381,6 +387,34 @@ class UdfRewriter:
             planner = Planner(self.schema)
             new_query_str = planner.remove_laterals(new_query_str)
         return new_query_str
+
+    def rewrite_query_inside_loop(self, query: str):
+        tokens = scan(query)
+        rhs_ast = parse_sql(query)
+        VarToArrayRefRewriter(self.get_local_var_names())(rhs_ast)
+        new_query = IndentedStream()(rhs_ast)
+        """
+        HACK: We need to be able to tell if an assignment is a real query i.e. one 
+        that SELECTs from the database, or just a PL/pgSQL expression like 
+        "a := b + 1". We do this by checking if there is a FROM clause in the query.
+
+        If it ends up not being a "real" query, we have to do some post-processing
+        to make sure deparsing it doesn't result in it being executed as a real 
+        query, which is an issue because the deparser automatically adds SELECT to
+        the beginning of the query.
+
+        We don't want the deparser to add SELECT to the beginning of the query
+        because this makes it much slower.
+        """
+        real_query = any(
+            token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM" for token
+            in tokens)
+        if not real_query:
+            first_token = tokens[0]
+            assert (
+                        first_token.kind == "RESERVED_KEYWORD" and first_token.name.upper() == "SELECT")
+            new_query = new_query[len("SELECT "):]
+        return new_query
 
     def get_local_var_names(self):
         return set([var.name for var in self.vars.values()])
