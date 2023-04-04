@@ -19,3 +19,9 @@ class Schema:
             if isinstance(col, ast.ColumnDef):
                 cols[col.colname] = col
         self.add_table(name, cols)
+
+    def get_columns(self, tables):
+        columns = set()
+        for table in tables:
+            columns = columns.union(self.tables[table].keys())
+        return columns

@@ -1,7 +1,7 @@
 from collections import defaultdict
 from enum import Enum, IntEnum, auto
 from pglast import ast, parse_sql
-from pglast.enums import JoinType, SetOperation
+from pglast.enums import JoinType, SetOperation, BoolExprType
 from pglast.stream import IndentedStream
 from pglast.visitors import Visitor, Skip
 import pydot
@@ -38,6 +38,16 @@ class AggFinder(Visitor):
 
     def visit_SelectStmt(self, parent, node: ast.SelectStmt):
         return Skip
+
+
+class DependentFilterChecker(Visitor):
+    def __init__(self, outer_rels: set, schema: Schema):
+        self.is_dependent = False
+        self.outer_cols = schema.get_columns(outer_rels)
+
+    def visit_ColumnRef(self, parent, node: ast.ColumnRef):
+        if node.fields and node.fields[-1].val in self.outer_cols:
+            self.is_dependent = True
 
 
 class NodeType(Enum):
@@ -124,9 +134,11 @@ class Node:
         return self.graph_node
 
     def child(self):
+        assert len(self.children) == 1
         return self.children[0]
 
     def left(self):
+        assert len(self.children) > 1
         return self.children[0]
 
     def right(self):
@@ -243,10 +255,14 @@ class Node:
 
 
 class DependentJoin(Node):
-    def __init__(self, left, right):
+    def __init__(self, left: Node, right: Node, schema: Schema):
         super().__init__(type=NodeType.DEPENDENT_JOIN)
         self.children.append(left)
         self.children.append(right)
+        self.quals = []
+        self.schema = schema
+        assert isinstance(left, TableScan)
+        self.outer_table = left.table
 
     def remove_dependent_joins(self):
         if self.children is not None:
@@ -266,9 +282,13 @@ class TableScan(Node):
 
     def push_down_dependent_join(self, join: DependentJoin):
         ast_node = ast.JoinExpr(
-            jointype=JoinType.JOIN_LEFT, isNatural=False, larg=None, rarg=None
+            jointype=JoinType.JOIN_LEFT,
+            isNatural=False,
+            larg=None,
+            rarg=None,
+            quals=ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
         )
-        return Join(ast_node, join.child(), self, JoinType.JOIN_LEFT)
+        return Join(ast_node, join.left(), self)
 
 
 class SetOp(Node):
@@ -312,10 +332,16 @@ class Filter(Node):
         return child_ast
 
     def push_down_dependent_join(self, join: DependentJoin):
-        self.children = [
-            child.push_down_dependent_join(join) for child in self.children
-        ]
-        return self
+        outer_rel = join.left()
+        assert isinstance(outer_rel, TableScan)
+        dependency_checker = DependentFilterChecker({outer_rel.table}, join.schema)
+        dependency_checker(self.predicate)
+        if dependency_checker.is_dependent:
+            join.quals.append(self.predicate)
+            return self.child().push_down_dependent_join(join)
+        else:
+            self.child().push_down_dependent_join(join)
+            return self
 
 
 class Project(Node):
@@ -378,6 +404,12 @@ class Join(Node):
             quals=self.quals,
         )
 
+    def push_down_dependent_join(self, join: DependentJoin):
+        self.children = [
+            child.push_down_dependent_join(join) for child in self.children
+        ]
+        return self
+
 
 class Agg(Node):
     def __init__(self, target_list, group_clause, agg_targets, child):
@@ -403,6 +435,19 @@ class Agg(Node):
         parent_ast.groupClause = self.agg_keys
         parent_ast.targetList = self.target_list
         return parent_ast
+
+    def push_down_dependent_join(self, join: DependentJoin):
+        self.children[0] = self.child().push_down_dependent_join(join)
+        if self.agg_keys is None:
+            self.agg_keys = [
+                ast.ColumnRef(fields=[ast.String(col)])
+                for col in join.schema.get_columns([join.outer_table])
+            ]
+        else:
+            raise NotImplementedError(
+                "Dependent join pushdown not implemented for group by"
+            )
+        return self
 
 
 class OrderBy(Node):
@@ -456,6 +501,11 @@ class Planner:
     def __init__(self, schema: Schema):
         self.schema = schema
 
+    def remove_laterals(self, query_str: str) -> str:
+        plan = self.plan_query(query_str)
+        plan.remove_dependent_joins()
+        return IndentedStream()(plan.deparse())
+
     def plan_query(self, query_str: str):
         select_stmt = parse_sql(query_str)[0].stmt
         result = Result(self.plan_select(select_stmt), into=select_stmt.intoClause)
@@ -486,7 +536,7 @@ class Planner:
                 1:
             ]:
                 if isinstance(right_ast, ast.RangeSubselect) and right_ast.lateral:
-                    left_node = DependentJoin(left_node, right_node)
+                    left_node = DependentJoin(left_node, right_node, self.schema)
                 else:  # assume cross join, filter handled in WHERE clause
                     left_node = Join(
                         right_ast, left_node, right_node, join_type=JoinType.JOIN_INNER
@@ -497,8 +547,15 @@ class Planner:
             node = None
 
         # WHERE
+
         if select_stmt.whereClause is not None:
-            node = Filter(select_stmt.whereClause, node)
+            if isinstance(select_stmt.whereClause, ast.BoolExpr):
+                assert select_stmt.whereClause.boolop == BoolExprType.AND_EXPR
+                for qual in select_stmt.whereClause.args:
+                    node = Filter(qual, node)
+            else:
+                assert isinstance(select_stmt.whereClause, ast.A_Expr)
+                node = Filter(select_stmt.whereClause, node)
 
         # GROUP BY / Scalar aggregate
         agg_targets = []
@@ -542,7 +599,6 @@ class Planner:
 
 
 if __name__ == "__main__":
-
     #     query = """SELECT ca_state
     #      , d_year
     #      , d_qoy
@@ -555,11 +611,29 @@ if __name__ == "__main__":
     #        , d_year
     #        , d_qoy;"""
 
-    query = """SELECT * FROM t1, LATERAL (SELECT * FROM t2) dt1"""
+    # query = """SELECT x FROM t1, LATERAL (SELECT k FROM t2 WHERE x = k) dt1"""
+
+    query = """SELECT ARRAY_AGG(agg_0)
+        INTO numsalesfromstore
+        
+        FROM temp
+           , LATERAL (SELECT COUNT(*) AS agg_0
+                      FROM store_sales_history
+                      WHERE (ss_customer_sk = ckey)
+                        AND (ss_sold_date_sk >= fromdatesk)
+                        AND (ss_sold_date_sk <= todatesk)) AS dt1"""
 
     print(parse_sql(query))
     print(IndentedStream()(parse_sql(query)[0].stmt))
     schema = Schema()
+    # schema.add_table(
+    #     "temp",
+    #     {"manager": "varchar(40)", "yr": "int"},
+    # )
+    schema.add_table(
+        "temp",
+        {"ckey": "int", "fromdatesk": "int", "todatesk": "int"},
+    )
     planner = Planner(schema)
 
     plan = planner.plan_query(query)

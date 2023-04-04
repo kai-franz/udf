@@ -8,6 +8,7 @@ from pglast.visitors import Visitor
 from typing import List
 
 from udf.schema import Schema
+from udf.planner import Planner
 
 
 class BaseType(Enum):
@@ -105,7 +106,9 @@ class FunctionBodyRewriter(Visitor):
 
 
 class UdfRewriter:
-    def __init__(self, f: str, schema: Schema):
+    def __init__(self, f: str, schema: Schema, remove_laterals=False):
+        self.schema = schema
+        self.remove_laterals = remove_laterals
         self.sql_tree = parse_sql(f)[0].stmt
         self.tree = parse_plpgsql(f)[0]["PLpgSQL_function"]
         self.vars = {}  # maps varnos to variable names
@@ -117,7 +120,6 @@ class UdfRewriter:
         self.rewrite_body()
         self.replace_function_body("\n".join(self.flatten_program(self.out)))
         self.output_sql = IndentedStream()(self.sql_tree) + ";"
-        self.schema = schema
 
     def output(self) -> str:
         return self.output_sql
@@ -373,7 +375,12 @@ class UdfRewriter:
         if into is not None:
             new_query.intoClause = self.generate_into_clause(into)
 
-        return IndentedStream()(new_query)
+        new_query_str = IndentedStream()(new_query)
+
+        if self.remove_laterals:
+            planner = Planner(self.schema)
+            new_query_str = planner.remove_laterals(new_query_str)
+        return new_query_str
 
     def get_local_var_names(self):
         return set([var.name for var in self.vars.values()])

@@ -11,7 +11,7 @@ query_input_dir = sys.argv[1]
 udf_input_dir = sys.argv[2]
 output_dir = sys.argv[3]
 
-udfs = [1, 5, 6, 7, 12, 13]
+udfs = [1, 5, 6, 7, 13]  # 12
 files = [f"sudf_{udf}.sql" for udf in udfs]
 
 
@@ -21,7 +21,7 @@ def rewrite_query(query_file_name, udf_file_name, output_file_name):
         query = query_file.read()
     with open(udf_file_name, "r") as udf_file:
         udf = udf_file.read()
-    r = Rewriter(query, udf)
+    r = Rewriter(query, udf, remove_laterals=True)
     with open(output_file_name, "w") as out_file:
         out_file.write(r.new_udf())
         out_file.write("\n\n\n")
