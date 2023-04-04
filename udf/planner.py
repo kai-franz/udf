@@ -264,6 +264,7 @@ class DependentJoin(Node):
         self.schema = schema
         assert isinstance(left, TableScan)
         self.outer_table = left.table
+        self.cols = left.cols.union(right.cols)
 
     def remove_dependent_joins(self):
         if self.children is not None:
@@ -276,6 +277,7 @@ class TableScan(Node):
         super().__init__(schema, NodeType.TABLE_SCAN)
         self.ast_node = ast_node
         self.table = ast_node.relname
+        self.cols = schema.get_columns_for_table(self.table)
         self.graph_node = pydot.Node(self.table)
 
     def deparse(self):
@@ -324,6 +326,7 @@ class Filter(Node):
         super().__init__(schema, type=NodeType.FILTER)
         self.predicate = predicate
         self.children.append(child)
+        self.cols = child.cols
 
     def deparse(self):
         child_ast = self.rewrite_child_if_needed(
@@ -355,6 +358,10 @@ class Project(Node):
         self.exprs = exprs
         if child is not None:
             self.children.append(child)
+            # TODO: Fix this to accurately reflect columns in the project
+            self.cols = child.cols
+        else:
+            self.cols = set()
 
     def deparse(self):
         if len(self.children) == 0:
@@ -393,6 +400,7 @@ class Join(Node):
         self.ast_node = ast_node
         self.children.append(left)
         self.children.append(right)
+        self.cols = left.cols.union(right.cols)
         if join_type is None:
             # Explicit join; infer join type from AST
             self.join_type = ast_node.jointype
@@ -433,6 +441,8 @@ class Agg(Node):
             self.agg_keys = None
         self.target_list = target_list
         self.children.append(child)
+        # TODO: Fix this to accurately reflect columns in the aggregate
+        self.cols = child.cols
 
     def deparse(self):
         parent_ast = self.rewrite_child_if_needed(
@@ -462,6 +472,7 @@ class OrderBy(Node):
         super().__init__(schema, NodeType.ORDER_BY)
         self.sort_clause = sort_clause
         self.children.append(child)
+        self.cols = child.cols
 
     def deparse(self):
         parent_ast = self.rewrite_child_if_needed(
@@ -479,6 +490,7 @@ class Limit(Node):
         self.limit_offset = select_stmt.limitOffset
         self.limit_option = select_stmt.limitOption
         self.children.append(child)
+        self.cols = child.cols
 
     def deparse(self):
         parent_ast = self.rewrite_child_if_needed(
@@ -496,6 +508,7 @@ class Result(Node):
         super().__init__(schema, NodeType.RESULT)
         self.children.append(child)
         self.into = into
+        self.cols = child.cols
 
     def deparse(self):
         child_ast = self.child().deparse()
