@@ -50,6 +50,22 @@ class DependentFilterChecker(Visitor):
             self.is_dependent = True
 
 
+class ColumnRefFinder(Visitor):
+    def __init__(self):
+        self.cols = set()
+
+    def visit_ColumnRef(self, parent, node: ast.ColumnRef):
+        if node.fields:
+            self.cols.add(node.fields[-1].val)
+
+
+class EmptyTargetListFixer(Visitor):
+    def visit_SelectStmt(self, parent, node: ast.SelectStmt):
+        if not node.targetList or len(node.targetList) == 0:
+            # change the target list to be a single * node
+            node.targetList = [ast.ResTarget(val=ast.A_Star())]
+
+
 class NodeType(Enum):
     TABLE_SCAN = 0
     UNION = auto()
@@ -254,6 +270,25 @@ class Node:
             self.children = [child.remove_dependent_joins() for child in self.children]
         return self
 
+    def push_down_filters(self):
+        if self.children is not None:
+            self.children = [child.push_down_filters() for child in self.children]
+            for i, child in enumerate(self.children):
+                if isinstance(child, Filter):
+                    self.children[i] = child.child().push_down_filter(child)
+                    assert len(self.children) == 1
+                    self.cols = self.children[i].cols
+        return self
+
+    def push_down_filter(self, filter_node):
+        if isinstance(self, TableScan):
+            filter_node.children[0] = self
+            filter_node.cols = self.cols
+            return filter_node
+        self.children[0] = self.children[0].push_down_filter(filter_node)
+        self.cols = self.children[0].cols
+        return self
+
 
 class DependentJoin(Node):
     def __init__(self, left: Node, right: Node, schema: Schema):
@@ -285,11 +320,11 @@ class TableScan(Node):
 
     def push_down_dependent_join(self, join: DependentJoin):
         ast_node = ast.JoinExpr(
-            jointype=JoinType.JOIN_LEFT,
+            jointype=JoinType.JOIN_INNER,
             isNatural=False,
             larg=None,
             rarg=None,
-            quals=ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
+            quals=None,  # ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
         )
         return Join(self.schema, ast_node, join.left(), self)
 
@@ -327,6 +362,9 @@ class Filter(Node):
         self.predicate = predicate
         self.children.append(child)
         self.cols = child.cols
+        column_finder = ColumnRefFinder()
+        column_finder(predicate)
+        self.dependent_cols = column_finder.cols
 
     def deparse(self):
         child_ast = self.rewrite_child_if_needed(
@@ -334,9 +372,18 @@ class Filter(Node):
         )
         child_ast = self.construct_subselect(child_ast)
 
-        if child_ast.whereClause is None:
-            child_ast.whereClause = []
-        child_ast.whereClause = self.predicate
+        if child_ast.whereClause is not None:
+            if isinstance(child_ast.whereClause, ast.A_Expr):
+                child_ast.whereClause = ast.BoolExpr(
+                    boolop=BoolExprType.AND_EXPR, args=[child_ast.whereClause]
+                )
+            else:
+                assert isinstance(child_ast.whereClause, ast.BoolExpr)
+                child_ast.whereClause.args = list(child_ast.whereClause.args) + [
+                    self.predicate
+                ]
+        else:
+            child_ast.whereClause = self.predicate
         return child_ast
 
     def push_down_dependent_join(self, join: DependentJoin):
@@ -373,8 +420,7 @@ class Project(Node):
             )
         child_ast = self.child().deparse()
         print("child_ast: ", child_ast)
-        # For now, we always wrap the child in a subselect
-        # for project nodes.
+        # For now, we always wrap the child in a subselect for project nodes.
         child_ast = self.construct_subselect(child_ast)
         if (
             child_ast.targetList is None
@@ -423,6 +469,40 @@ class Join(Node):
         self.children = [
             child.push_down_dependent_join(join) for child in self.children
         ]
+        return self
+
+    def push_down_filter(self, filter_node: Filter):
+        col_finder = ColumnRefFinder()
+        col_finder(filter_node.predicate)
+        filter_cols = col_finder.cols
+        # filter_cols = col_finder.cols.difference(
+        #     self.schema.get_columns_for_table("temp")
+        # )
+        if filter_cols.issubset(self.left().cols):
+            self.children[0] = self.left().push_down_filter(filter_node)
+        elif filter_cols.issubset(self.right().cols):
+            self.children[1] = self.right().push_down_filter(filter_node)
+        elif filter_cols.issubset(self.cols):
+            # Filter is a join predicate.
+            # TODO: This should be okay for now, but there might already be a join
+            # predicate in the AST. We should check for that and combine the predicates.
+            if self.quals is None:
+                self.quals = filter_node.predicate
+            elif isinstance(self.quals, ast.A_Expr):
+                self.quals = ast.BoolExpr(
+                    boolop=BoolExprType.AND_EXPR,
+                    args=[self.quals, filter_node.predicate],
+                )
+            elif isinstance(self.quals, ast.BoolExpr):
+                self.quals.args = list(self.quals.args) + [filter_node.predicate]
+            else:
+                assert False, "Unexpected join quals type"
+        else:
+            print(filter_cols)
+            filter_node.children[0] = self
+            filter_node.cols = self.cols
+            return filter_node
+        self.cols = self.left().cols.union(self.right().cols)
         return self
 
 
@@ -513,6 +593,7 @@ class Result(Node):
     def deparse(self):
         child_ast = self.child().deparse()
         child_ast.intoClause = self.into
+        EmptyTargetListFixer()(child_ast)
         return child_ast
 
 
@@ -523,18 +604,30 @@ class Planner:
     def remove_laterals(self, query_str: str) -> str:
         plan = self.plan_query(query_str)
         plan.remove_dependent_joins()
+        graph = pydot.Dot(graph_type="digraph")
+        plan.visualize(graph)
+        graph.write_png("plan_flattened.png")
+        print(plan.deparse())
         return IndentedStream()(plan.deparse())
 
     def plan_query(self, query_str: str):
         select_stmt = parse_sql(query_str)[0].stmt
+
+        # Recursively plan the query
         result = Result(
             self.schema, self.plan_select(select_stmt), into=select_stmt.intoClause
         )
+
+        # Push down filters
+        result.push_down_filters()
 
         # Visualization
         graph = pydot.Dot(graph_type="digraph")
         result.visualize(graph)
         graph.write_png("plan.png")
+        # deparsed_ast = result.deparse()
+        # print(deparsed_ast)
+        # print(IndentedStream()(deparsed_ast))
         return result
 
     def plan_select(self, select_stmt: ast.SelectStmt) -> Node:
