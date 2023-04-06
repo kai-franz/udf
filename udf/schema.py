@@ -27,10 +27,13 @@ class Schema:
                 cols[col.colname] = col
         self.add_table(name, cols)
 
+    def get_columns_for_table(self, table):
+        return set(self.tables[table].keys())
+
     def get_columns(self, tables):
         columns = set()
         for table in tables:
-            columns = columns.union(self.tables[table].keys())
+            columns = columns.union(self.get_columns_for_table(table))
         return columns
 
 
