@@ -66,6 +66,15 @@ class EmptyTargetListFixer(Visitor):
             node.targetList = [ast.ResTarget(val=ast.A_Star())]
 
 
+class Naming:
+    names = defaultdict(int)
+
+    @staticmethod
+    def next_join_name():
+        Naming.names["join"] += 1
+        return "join" + str(Naming.names["join"])
+
+
 class NodeType(Enum):
     TABLE_SCAN = 0
     UNION = auto()
@@ -325,6 +334,7 @@ class TableScan(Node):
             larg=None,
             rarg=None,
             quals=None,  # ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
+            alias=ast.Alias(Naming.next_join_name()),
         )
         return Join(self.schema, ast_node, join.left(), self)
 
@@ -463,6 +473,7 @@ class Join(Node):
             rarg=self.right().deparse(),
             isNatural=False,
             quals=self.quals,
+            alias=self.ast_node.alias,
         )
 
     def push_down_dependent_join(self, join: DependentJoin):
