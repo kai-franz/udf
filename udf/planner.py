@@ -1,7 +1,9 @@
 from collections import defaultdict
-from enum import Enum, IntEnum, auto
+from typing import Set
+from enum import Enum, auto
+
 from pglast import ast, parse_sql
-from pglast.enums import JoinType, SetOperation, BoolExprType
+from pglast.enums import JoinType, SetOperation, BoolExprType, A_Expr_Kind
 from pglast.stream import IndentedStream
 from pglast.visitors import Visitor, Skip
 import pydot
@@ -26,6 +28,62 @@ AGG_FUNCS = {
     "sum",
     "xmlagg",
 }
+
+
+class NodeType(Enum):
+    TABLE_SCAN = 0
+    UNION = auto()
+    INTERSECT = auto()
+    EXCEPT = auto()
+    FILTER = auto()
+    AGG = auto()
+    HAVING = auto()
+    PROJECT = auto()
+    JOIN = auto()
+    DEPENDENT_JOIN = auto()
+    ORDER_BY = auto()
+    LIMIT = auto()
+    RESULT = auto()
+
+    def camel_case_name(self):
+        return "".join([w.capitalize() for w in self.name.split("_")])
+
+    @staticmethod
+    def from_setop(set_op: SetOperation):
+        if set_op == SetOperation.SETOP_UNION:
+            return NodeType.UNION
+        elif set_op == SetOperation.SETOP_INTERSECT:
+            return NodeType.INTERSECT
+        elif set_op == SetOperation.SETOP_EXCEPT:
+            return NodeType.EXCEPT
+        raise Exception("Unknown set operation")
+
+    def to_setop(self):
+        if self == NodeType.UNION:
+            return SetOperation.SETOP_UNION
+        elif self == NodeType.INTERSECT:
+            return SetOperation.SETOP_INTERSECT
+        elif self == NodeType.EXCEPT:
+            return SetOperation.SETOP_EXCEPT
+        raise Exception("Unknown set operation")
+
+
+def add_to_quals(quals, pred):
+    # TODO: This should be okay for now, but there might already be a join
+    # predicate in the AST. We should check for that and combine the predicates.
+    if quals is None:
+        quals = pred
+    elif isinstance(quals, ast.A_Expr):
+        quals = ast.BoolExpr(
+            boolop=BoolExprType.AND_EXPR,
+            args=[quals, pred],
+        )
+        return quals
+    elif isinstance(quals, ast.BoolExpr):
+        quals.args = list(quals.args) + [pred]
+    else:
+        assert False, "Unexpected join quals type"
+    return quals
 
 
 class AggFinder(Visitor):
@@ -74,43 +132,15 @@ class Naming:
         Naming.names["join"] += 1
         return "join" + str(Naming.names["join"])
 
-
-class NodeType(Enum):
-    TABLE_SCAN = 0
-    UNION = auto()
-    INTERSECT = auto()
-    EXCEPT = auto()
-    FILTER = auto()
-    AGG = auto()
-    HAVING = auto()
-    PROJECT = auto()
-    JOIN = auto()
-    DEPENDENT_JOIN = auto()
-    ORDER_BY = auto()
-    LIMIT = auto()
-    RESULT = auto()
-
-    def camel_case_name(self):
-        return "".join([w.capitalize() for w in self.name.split("_")])
+    @staticmethod
+    def next_alias(name: str):
+        name = name.lower()
+        Naming.names[name] += 1
+        return name + str(Naming.names[name])
 
     @staticmethod
-    def from_setop(set_op: SetOperation):
-        if set_op == SetOperation.SETOP_UNION:
-            return NodeType.UNION
-        elif set_op == SetOperation.SETOP_INTERSECT:
-            return NodeType.INTERSECT
-        elif set_op == SetOperation.SETOP_EXCEPT:
-            return NodeType.EXCEPT
-        raise Exception("Unknown set operation")
-
-    def to_setop(self):
-        if self == NodeType.UNION:
-            return SetOperation.SETOP_UNION
-        elif self == NodeType.INTERSECT:
-            return SetOperation.SETOP_INTERSECT
-        elif self == NodeType.EXCEPT:
-            return SetOperation.SETOP_EXCEPT
-        raise Exception("Unknown set operation")
+    def next_alias_from_type(type: NodeType):
+        return Naming.next_alias(type.name)
 
 
 class Ordering:
@@ -147,6 +177,7 @@ class Node:
             self.graph_node = pydot.Node(
                 type.name + "_" + str(self.id), label=type.camel_case_name()
             )
+            self.alias = Naming.next_alias_from_type(type)
 
     @staticmethod
     def next_id(node_type):
@@ -248,6 +279,15 @@ class Node:
             alias=ast.Alias(Node.next_derived_table()),
         )
 
+    def construct_join_expr(self, child_ast):
+        if isinstance(child_ast, ast.SelectStmt):
+            return ast.RangeSubselect(
+                lateral=False,
+                subquery=child_ast,
+                alias=ast.Alias(Node.next_derived_table()),
+            )
+        return child_ast
+
     def rewrite_child_if_needed(self, child_ast, child_order: int):
         parent_order = self.get_order()
         if Ordering.can_coalesce(parent_order, child_order):
@@ -298,17 +338,25 @@ class Node:
         self.cols = self.children[0].cols
         return self
 
+    def get_alias(self):
+        return self.child().get_alias()
+
 
 class DependentJoin(Node):
     def __init__(self, left: Node, right: Node, schema: Schema):
+        assert isinstance(left, TableScan)
+
         super().__init__(schema, NodeType.DEPENDENT_JOIN)
         self.children.append(left)
         self.children.append(right)
         self.quals = []
         self.schema = schema
-        assert isinstance(left, TableScan)
         self.outer_table = left.table
         self.cols = left.cols.union(right.cols)
+        self.join_type = None
+
+    def get_outer_cols(self) -> Set[str]:
+        return self.schema.get_columns_for_table(self.outer_table)
 
     def remove_dependent_joins(self):
         if self.children is not None:
@@ -323,18 +371,23 @@ class TableScan(Node):
         self.table = ast_node.relname
         self.cols = schema.get_columns_for_table(self.table)
         self.graph_node = pydot.Node(self.table)
+        self.alias = Naming.next_alias(self.table)
 
     def deparse(self):
+        self.ast_node.alias = ast.Alias(self.alias)
         return self.ast_node
 
     def push_down_dependent_join(self, join: DependentJoin):
+        if join.join_type is None:
+            join_type = JoinType.JOIN_INNER
+        else:
+            join_type = join.join_type
         ast_node = ast.JoinExpr(
-            jointype=JoinType.JOIN_INNER,
+            jointype=join_type,
             isNatural=False,
             larg=None,
             rarg=None,
-            quals=None,  # ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
-            alias=ast.Alias(Naming.next_join_name()),
+            quals=ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
         )
         return Join(self.schema, ast_node, join.left(), self)
 
@@ -343,7 +396,8 @@ class SetOp(Node):
     def __init__(
         self, schema: Schema, ast_node: ast.SelectStmt, left: Node, right: Node
     ):
-        super().__init__(schema, NodeType.from_setop(ast_node.op))
+        type = NodeType.from_setop(ast_node.op)
+        super().__init__(schema, type)
         self.ast_node = ast_node
         self.all = ast_node.all
         self.children.append(left)
@@ -363,6 +417,7 @@ class SetOp(Node):
             rarg=right_ast,
             targetList=None,
             fromClause=None,
+            alias=self.alias,
         )
 
 
@@ -429,7 +484,6 @@ class Project(Node):
                 fromClause=None,
             )
         child_ast = self.child().deparse()
-        print("child_ast: ", child_ast)
         # For now, we always wrap the child in a subselect for project nodes.
         child_ast = self.construct_subselect(child_ast)
         if (
@@ -465,21 +519,47 @@ class Join(Node):
             # Implicit join; use join type provided by caller
             self.join_type = JoinType.JOIN_INNER
             self.quals = None
+        self.deferred_quals = set()
 
     def deparse(self):
+        left_ast = self.construct_join_expr(self.left().deparse())
+        right_ast = self.construct_join_expr(self.right().deparse())
+        quals = self.quals
+        for col in self.deferred_quals:
+            qual_expr = ast.A_Expr(
+                kind=A_Expr_Kind.AEXPR_OP,
+                name=[ast.String("=")],
+                lexpr=ast.ColumnRef(
+                    fields=[
+                        ast.String(self.left().alias),
+                        ast.String(col),
+                    ],
+                    location=-1,
+                ),
+                rexpr=ast.ColumnRef(
+                    fields=[
+                        ast.String(self.right().alias),
+                        ast.String(col),
+                    ],
+                    location=-1,
+                ),
+            )
+            quals = add_to_quals(quals, qual_expr)
         return ast.JoinExpr(
             jointype=self.join_type,
-            larg=self.left().deparse(),
-            rarg=self.right().deparse(),
+            larg=left_ast,
+            rarg=right_ast,
             isNatural=False,
-            quals=self.quals,
-            alias=self.ast_node.alias,
+            quals=quals,
+            alias=ast.Alias(self.alias),
         )
 
     def push_down_dependent_join(self, join: DependentJoin):
         self.children = [
             child.push_down_dependent_join(join) for child in self.children
         ]
+        for col in join.get_outer_cols():
+            self.deferred_quals.add(col)
         return self
 
     def push_down_filter(self, filter_node: Filter):
@@ -495,21 +575,8 @@ class Join(Node):
             self.children[1] = self.right().push_down_filter(filter_node)
         elif filter_cols.issubset(self.cols):
             # Filter is a join predicate.
-            # TODO: This should be okay for now, but there might already be a join
-            # predicate in the AST. We should check for that and combine the predicates.
-            if self.quals is None:
-                self.quals = filter_node.predicate
-            elif isinstance(self.quals, ast.A_Expr):
-                self.quals = ast.BoolExpr(
-                    boolop=BoolExprType.AND_EXPR,
-                    args=[self.quals, filter_node.predicate],
-                )
-            elif isinstance(self.quals, ast.BoolExpr):
-                self.quals.args = list(self.quals.args) + [filter_node.predicate]
-            else:
-                assert False, "Unexpected join quals type"
+            self.quals = add_to_quals(self.quals, filter_node.predicate)
         else:
-            print(filter_cols)
             filter_node.children[0] = self
             filter_node.cols = self.cols
             return filter_node
@@ -532,6 +599,7 @@ class Agg(Node):
             self.agg_keys = None
         self.target_list = target_list
         self.children.append(child)
+        # self.order_by = None
         # TODO: Fix this to accurately reflect columns in the aggregate
         self.cols = child.cols
 
@@ -545,12 +613,34 @@ class Agg(Node):
         return parent_ast
 
     def push_down_dependent_join(self, join: DependentJoin):
+        join.join_type = JoinType.JOIN_LEFT
         self.children[0] = self.child().push_down_dependent_join(join)
         if self.agg_keys is None:
             self.agg_keys = [
                 ast.ColumnRef(fields=[ast.String(col)])
                 for col in join.schema.get_columns([join.outer_table])
             ]
+            # self.order_by = self.schema.get_primary_key(join.outer_table)
+            self.target_list += (
+                ast.ColumnRef(fields=(self.schema.get_primary_key(join.outer_table),)),
+            )
+            # Rewrite COUNT(*) -> COUNT(join.outer_table.pk)
+            for i, target in enumerate(self.target_list):
+                # if isinstance(target, ast.ResTarget) and target.val == ast.FuncCall:
+                #     print("Found a function call: ", target.val.funcname)
+                if (
+                    isinstance(target, ast.ResTarget)
+                    and isinstance(target.val, ast.FuncCall)
+                    and target.val.funcname[0].val.upper() == "COUNT"
+                    and target.val.agg_star
+                ):
+                    print("Rewriting COUNT(*) to COUNT(join.outer_table.pk)")
+                    target.val.args = (
+                        ast.ColumnRef(
+                            fields=(self.schema.get_primary_key(join.outer_table),)
+                        ),
+                    )
+                    target.val.agg_star = False
         else:
             raise NotImplementedError(
                 "Dependent join pushdown not implemented for group by"
@@ -618,8 +708,8 @@ class Planner:
         graph = pydot.Dot(graph_type="digraph")
         plan.visualize(graph)
         graph.write_png("plan_flattened.png")
-        print(plan.deparse())
-        return IndentedStream()(plan.deparse())
+        deparsed_ast = plan.deparse()
+        return IndentedStream()(deparsed_ast)
 
     def plan_query(self, query_str: str):
         select_stmt = parse_sql(query_str)[0].stmt
@@ -636,6 +726,7 @@ class Planner:
         graph = pydot.Dot(graph_type="digraph")
         result.visualize(graph)
         graph.write_png("plan.png")
+
         # deparsed_ast = result.deparse()
         # print(deparsed_ast)
         # print(IndentedStream()(deparsed_ast))
@@ -657,9 +748,8 @@ class Planner:
         # JOIN
         if len(from_tables) > 0:
             left_node = from_tables[0]
-            for right_node, right_ast in list(zip(from_tables, select_stmt.fromClause))[
-                1:
-            ]:
+            join_tables = list(zip(from_tables, select_stmt.fromClause))[1:]
+            for right_node, right_ast in join_tables:
                 if isinstance(right_ast, ast.RangeSubselect) and right_ast.lateral:
                     left_node = DependentJoin(left_node, right_node, self.schema)
                 else:  # assume cross join, filter handled in WHERE clause
@@ -763,10 +853,10 @@ if __name__ == "__main__":
     #     "temp",
     #     {"manager": "varchar(40)", "yr": "int"},
     # )
-    schema.add_table(
-        "temp",
-        {"ckey": "int", "fromdatesk": "int", "todatesk": "int"},
-    )
+    # schema.add_table(
+    #     "temp",
+    #     {"ckey": "int", "fromdatesk": "int", "todatesk": "int"},
+    # )
     planner = Planner(schema)
 
     plan = planner.plan_query(query)
