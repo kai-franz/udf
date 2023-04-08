@@ -1,4 +1,12 @@
 from pglast import ast, parse_sql
+from pglast.enums import ConstrType
+
+
+class Table:
+    def __init__(self, name, cols: dict, primary_key: str = None):
+        self.name = name
+        self.cols = cols
+        self.primary_key = primary_key
 
 
 class Schema:
@@ -16,19 +24,26 @@ class Schema:
                 continue
             self.add_table_from_ast(stmt)
 
-    def add_table(self, name, cols: dict):
-        self.tables[name] = cols
+    def add_table(self, name, cols: dict, primary_key: str = None):
+        self.tables[name] = Table(name, cols, primary_key)
 
     def add_table_from_ast(self, table_ast: ast.CreateStmt):
         name = table_ast.relation.relname
         cols = {}
+        primary_key = None
         for col in table_ast.tableElts:
             if isinstance(col, ast.ColumnDef):
                 cols[col.colname] = col
-        self.add_table(name, cols)
+                if col.constraints:
+                    for constraint in col.constraints:
+                        assert isinstance(constraint, ast.Constraint)
+                        if constraint.contype == ConstrType.CONSTR_PRIMARY:
+                            assert primary_key is None
+                            primary_key = col.colname
+        self.add_table(name, cols, primary_key=primary_key)
 
     def get_columns_for_table(self, table):
-        return set(self.tables[table].keys())
+        return set(self.tables[table].cols.keys())
 
     def get_columns(self, tables):
         columns = set()
