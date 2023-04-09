@@ -1,3 +1,4 @@
+import copy
 from collections import defaultdict
 from typing import Set
 from enum import Enum, auto
@@ -9,6 +10,7 @@ from pglast.visitors import Visitor, Skip
 import pydot
 
 from udf.schema import Schema, ProcBenchSchema
+from udf.utils import TEMP_TABLE_NAME
 
 AGG_FUNCS = {
     "array_agg",
@@ -117,11 +119,27 @@ class ColumnRefFinder(Visitor):
             self.cols.add(node.fields[-1].val)
 
 
+def get_col_refs(node: ast.Node):
+    finder = ColumnRefFinder()
+    finder(node)
+    return finder.cols
+
+
 class EmptyTargetListFixer(Visitor):
     def visit_SelectStmt(self, parent, node: ast.SelectStmt):
         if not node.targetList or len(node.targetList) == 0:
             # change the target list to be a single * node
             node.targetList = [ast.ResTarget(val=ast.A_Star())]
+
+
+class SuffixAppender(Visitor):
+    def __init__(self, suffix: str, cols: Set[str]):
+        self.suffix = suffix
+        self.cols = cols
+
+    def visit_ColumnRef(self, parent, node: ast.ColumnRef):
+        if node.fields and node.fields[-1].val in self.cols:
+            node.fields[-1].val += self.suffix
 
 
 class Naming:
@@ -169,6 +187,7 @@ class Node:
 
     def __init__(self, schema: Schema, type: NodeType):
         self.children = []
+        self.dependent_cols = set()
         self.type = type
         self.schema = schema
         if type != NodeType.TABLE_SCAN:
@@ -341,6 +360,19 @@ class Node:
     def get_alias(self):
         return self.child().get_alias()
 
+    def set_dependent_cols(self, dependent_cols: Set[str]):
+        # Add the dependent columns to the current node.
+        # TODO: Handle nested dependent joins.
+        self.dependent_cols = self.dependent_cols.union(dependent_cols)
+        for child in self.children:
+            child.set_dependent_cols(dependent_cols)
+
+    def set_col_refs(self, col_refs: Set[str]):
+        raise NotImplementedError()
+
+    def get_suffix(self):
+        return self.child().get_suffix()
+
 
 class DependentJoin(Node):
     def __init__(self, left: Node, right: Node, schema: Schema):
@@ -354,6 +386,7 @@ class DependentJoin(Node):
         self.outer_table = left.table
         self.cols = left.cols.union(right.cols)
         self.join_type = None
+        self.right().set_dependent_cols(self.get_outer_cols())
 
     def get_outer_cols(self) -> Set[str]:
         return self.schema.get_columns_for_table(self.outer_table)
@@ -375,19 +408,50 @@ class TableScan(Node):
 
     def deparse(self):
         self.ast_node.alias = ast.Alias(self.alias)
+        if self.table == TEMP_TABLE_NAME:
+            suffix = self.get_suffix()
+            return ast.SelectStmt(
+                targetList=[
+                    ast.ResTarget(
+                        val=ast.ColumnRef(fields=[ast.String(col)]), name=col + suffix
+                    )
+                    for col in self.schema.get_columns_for_table(self.table)
+                ],
+                fromClause=[self.ast_node],
+            )
         return self.ast_node
+
+    def set_col_refs(self, col_refs: Set[str]):
+        self.col_refs = col_refs
+
+    def get_suffix(self):
+        if self.table == TEMP_TABLE_NAME:
+            return self.alias[len(self.table) :]
+        return None
 
     def push_down_dependent_join(self, join: DependentJoin):
         if join.join_type is None:
             join_type = JoinType.JOIN_INNER
         else:
             join_type = join.join_type
+
+        if len(join.quals) == 0:
+            # No quals. No need to create a join expression.
+            # Use a cross join instead (denoted by type=INNER, quals=None).
+            # return self
+            qual_expr = None
+            join_type = JoinType.JOIN_INNER
+        else:
+            qual_expr = ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals)
+            dependent_cols = join.get_outer_cols()
+            SuffixAppender(join.left().get_suffix(), dependent_cols)(qual_expr)
+
         ast_node = ast.JoinExpr(
             jointype=join_type,
             isNatural=False,
             larg=None,
             rarg=None,
-            quals=ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals),
+            quals=qual_expr,
         )
         return Join(self.schema, ast_node, join.left(), self)
 
@@ -420,6 +484,17 @@ class SetOp(Node):
             alias=self.alias,
         )
 
+    def get_suffix(self):
+        assert self.type == NodeType.UNION
+        # TODO: support intersection and difference.
+        left_suffix = self.left().get_suffix()
+        right_suffix = self.right().get_suffix()
+        if left_suffix is not None:
+            return left_suffix
+        if right_suffix is not None:
+            return right_suffix
+        return None
+
 
 class Filter(Node):
     def __init__(self, schema: Schema, predicate, child):
@@ -427,9 +502,7 @@ class Filter(Node):
         self.predicate = predicate
         self.children.append(child)
         self.cols = child.cols
-        column_finder = ColumnRefFinder()
-        column_finder(predicate)
-        self.dependent_cols = column_finder.cols
+        self.dependent_cols = get_col_refs(predicate)
 
     def deparse(self):
         child_ast = self.rewrite_child_if_needed(
@@ -457,9 +530,11 @@ class Filter(Node):
         dependency_checker = DependentFilterChecker({outer_rel.table}, join.schema)
         dependency_checker(self.predicate)
         if dependency_checker.is_dependent:
+            print("Filter is dependent:", IndentedStream()(self.predicate))
             join.quals.append(self.predicate)
             return self.child().push_down_dependent_join(join)
         else:
+            print("Filter is NOT dependent: ", IndentedStream()(self.predicate))
             self.child().push_down_dependent_join(join)
             return self
 
@@ -525,21 +600,24 @@ class Join(Node):
         left_ast = self.construct_join_expr(self.left().deparse())
         right_ast = self.construct_join_expr(self.right().deparse())
         quals = self.quals
+        l_suffix = self.left().get_suffix()
+        r_suffix = self.right().get_suffix()
         for col in self.deferred_quals:
             qual_expr = ast.A_Expr(
                 kind=A_Expr_Kind.AEXPR_OP,
                 name=[ast.String("=")],
                 lexpr=ast.ColumnRef(
                     fields=[
-                        ast.String(self.left().alias),
-                        ast.String(col),
+                        # ast.String(self.left().alias),
+                        ast.String(col + l_suffix),
+                        # implement suffix propagation
                     ],
                     location=-1,
                 ),
                 rexpr=ast.ColumnRef(
                     fields=[
                         ast.String(self.right().alias),
-                        ast.String(col),
+                        ast.String(col + r_suffix),
                     ],
                     location=-1,
                 ),
@@ -555,33 +633,72 @@ class Join(Node):
         )
 
     def push_down_dependent_join(self, join: DependentJoin):
-        self.children = [
-            child.push_down_dependent_join(join) for child in self.children
-        ]
+        dependent_quals = join.quals
+        join.quals = []
+        left_join_side, right_join_side = copy.deepcopy(join), copy.deepcopy(join)
+        assert isinstance(right_join_side.left(), TableScan)
+        right_join_side.left().alias = Naming.next_alias(right_join_side.left().table)
+        for qual in dependent_quals:
+            qual_refs = get_col_refs(qual) - join.get_outer_cols()
+            print("qual_refs: ", qual_refs)
+            if self.left().cols.issuperset(qual_refs):
+                print("moving to left side")
+                left_join_side.quals.append(qual)
+            elif self.right().cols.issuperset(qual_refs):
+                print("moving to right side")
+                right_join_side.quals.append(qual)
+            elif self.cols.issuperset(qual_refs):
+                print(qual)
+                print("left cols: ", self.left().cols)
+                print("right cols: ", self.right().cols)
+                raise Exception("Qual not pushed down to either side of join.")
+            else:
+                raise Exception("Qual discarded.")
+
+        self.children[0] = self.left().push_down_dependent_join(left_join_side)
+        self.children[1] = self.right().push_down_dependent_join(right_join_side)
         for col in join.get_outer_cols():
             self.deferred_quals.add(col)
         return self
 
     def push_down_filter(self, filter_node: Filter):
-        col_finder = ColumnRefFinder()
-        col_finder(filter_node.predicate)
-        filter_cols = col_finder.cols
+        filter_cols = get_col_refs(filter_node.predicate) - self.dependent_cols
         # filter_cols = col_finder.cols.difference(
         #     self.schema.get_columns_for_table("temp")
         # )
+        print("Pushing down filter:", IndentedStream()(filter_node.predicate))
         if filter_cols.issubset(self.left().cols):
+            print("Putting filter on left")
             self.children[0] = self.left().push_down_filter(filter_node)
         elif filter_cols.issubset(self.right().cols):
+            print("Putting filter on right")
             self.children[1] = self.right().push_down_filter(filter_node)
         elif filter_cols.issubset(self.cols):
             # Filter is a join predicate.
+            print("Putting filter on join")
+            # print("filter_cols: ", filter_cols)
+            # print("left cols: ", self.left().cols)
+            # print("right cols: ", self.right().cols)
             self.quals = add_to_quals(self.quals, filter_node.predicate)
         else:
+            print("Putting filter above join")
+            # print("filter_cols: ", filter_cols)
+            # print("left cols: ", self.left().cols)
+            # print("right cols: ", self.right().cols)
             filter_node.children[0] = self
             filter_node.cols = self.cols
             return filter_node
         self.cols = self.left().cols.union(self.right().cols)
         return self
+
+    def get_suffix(self):
+        left_suffix = self.left().get_suffix()
+        right_suffix = self.right().get_suffix()
+        if left_suffix is not None:
+            return left_suffix
+        if right_suffix is not None:
+            return right_suffix
+        return None
 
 
 class Agg(Node):
@@ -608,6 +725,7 @@ class Agg(Node):
             self.child().deparse(), self.child().get_order()
         )
         parent_ast = self.construct_subselect(parent_ast)
+        suffix = self.get_suffix()
         parent_ast.groupClause = self.agg_keys
         parent_ast.targetList = self.target_list
         return parent_ast
@@ -626,15 +744,12 @@ class Agg(Node):
             )
             # Rewrite COUNT(*) -> COUNT(join.outer_table.pk)
             for i, target in enumerate(self.target_list):
-                # if isinstance(target, ast.ResTarget) and target.val == ast.FuncCall:
-                #     print("Found a function call: ", target.val.funcname)
                 if (
                     isinstance(target, ast.ResTarget)
                     and isinstance(target.val, ast.FuncCall)
                     and target.val.funcname[0].val.upper() == "COUNT"
                     and target.val.agg_star
                 ):
-                    print("Rewriting COUNT(*) to COUNT(join.outer_table.pk)")
                     target.val.args = (
                         ast.ColumnRef(
                             fields=(self.schema.get_primary_key(join.outer_table),)
@@ -718,6 +833,10 @@ class Planner:
         result = Result(
             self.schema, self.plan_select(select_stmt), into=select_stmt.intoClause
         )
+
+        graph = pydot.Dot(graph_type="digraph")
+        result.visualize(graph)
+        graph.write_png("plan_raw.png")
 
         # Push down filters
         result.push_down_filters()
