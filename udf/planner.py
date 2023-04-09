@@ -704,6 +704,8 @@ class Join(Node):
 class Agg(Node):
     def __init__(self, schema: Schema, target_list, group_clause, agg_targets, child):
         super().__init__(schema, NodeType.AGG)
+        self.deferred_agg_keys = None
+        self.agg_pkey = None
         self.group_clause = group_clause
         self.agg_keys = [
             target for target, has_agg in zip(target_list, agg_targets) if not has_agg
@@ -726,22 +728,20 @@ class Agg(Node):
         )
         parent_ast = self.construct_subselect(parent_ast)
         suffix = self.get_suffix()
-        parent_ast.groupClause = self.agg_keys
-        parent_ast.targetList = self.target_list
-        return parent_ast
 
-    def push_down_dependent_join(self, join: DependentJoin):
-        join.join_type = JoinType.JOIN_LEFT
-        self.children[0] = self.child().push_down_dependent_join(join)
-        if self.agg_keys is None:
-            self.agg_keys = [
-                ast.ColumnRef(fields=[ast.String(col)])
-                for col in join.schema.get_columns([join.outer_table])
-            ]
-            # self.order_by = self.schema.get_primary_key(join.outer_table)
-            self.target_list += (
-                ast.ColumnRef(fields=(self.schema.get_primary_key(join.outer_table),)),
-            )
+        # If we have deferred agg keys, we need to add them to the group by clause.
+        if self.deferred_agg_keys is not None:
+
+            # Use the primary key of the outer relation in the dependent join
+            # as the group by key.
+            pkey_ref = ast.ColumnRef(fields=[ast.String(self.agg_pkey)])
+
+            # Append the correct suffix to the primary key.
+            SuffixAppender(suffix, self.deferred_agg_keys)(pkey_ref)
+
+            self.agg_keys = [pkey_ref]
+            self.target_list += (pkey_ref,)
+
             # Rewrite COUNT(*) -> COUNT(join.outer_table.pk)
             for i, target in enumerate(self.target_list):
                 if (
@@ -750,12 +750,19 @@ class Agg(Node):
                     and target.val.funcname[0].val.upper() == "COUNT"
                     and target.val.agg_star
                 ):
-                    target.val.args = (
-                        ast.ColumnRef(
-                            fields=(self.schema.get_primary_key(join.outer_table),)
-                        ),
-                    )
+                    target.val.args = (pkey_ref,)
                     target.val.agg_star = False
+
+        parent_ast.groupClause = self.agg_keys
+        parent_ast.targetList = self.target_list
+        return parent_ast
+
+    def push_down_dependent_join(self, join: DependentJoin):
+        join.join_type = JoinType.JOIN_LEFT
+        self.children[0] = self.child().push_down_dependent_join(join)
+        if self.agg_keys is None:
+            self.deferred_agg_keys = join.schema.get_columns([join.outer_table])
+            self.agg_pkey = join.schema.get_primary_key(join.outer_table)
         else:
             raise NotImplementedError(
                 "Dependent join pushdown not implemented for group by"
