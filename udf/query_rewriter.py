@@ -6,7 +6,7 @@ from pglast.stream import IndentedStream
 from pglast.visitors import Visitor
 
 
-def convertFunctionHeader(f: ast.CreateFunctionStmt):
+def convert_function_header(f: ast.CreateFunctionStmt):
     name = f.funcname[0].val
     argsTypeName = ast.String(name + "args")
     argType = ast.TypeName([argsTypeName], arrayBounds=[ast.Integer(-1)])
@@ -19,7 +19,7 @@ def convertFunctionHeader(f: ast.CreateFunctionStmt):
     f.returnType.names = tuple(returnTypeList)
 
 
-def getFunctionCalls(parseTree, udf_name):
+def get_function_calls(parseTree, udf_name):
     """
     Removes all function calls from the query,
     returning the list of function calls removed.
@@ -39,7 +39,7 @@ def getFunctionCalls(parseTree, udf_name):
     return visitor.function_calls
 
 
-def convertToSubquery(q: ast.SelectStmt):
+def convert_to_subquery(q: ast.SelectStmt):
     """
     Converts a query of the form (SELECT c1, c2, c3 FROM ...) into
     (SELECT c1, c2, c3 FROM (SELECT c1, c2, c3 FROM ...) as dt1)
@@ -55,7 +55,7 @@ def convertToSubquery(q: ast.SelectStmt):
     return new_query
 
 
-def getArrayAgg(q: ast.SelectStmt, col_refs: List[ast.ColumnRef]):
+def get_array_agg(q: ast.SelectStmt, col_refs: List[ast.ColumnRef]):
     """
     Converts a query of the form (SELECT c1, c2, c3 FROM ...) into
     (SELECT array_agg(row(c1, c2, c3)) FROM ...)
@@ -99,7 +99,7 @@ def new_array_agg(col_refs: List):
     return targetlist
 
 
-def getUniqueColRefs(col_refs: List[ast.ColumnRef]):
+def get_unique_col_refs(col_refs: List[ast.ColumnRef]):
     """
     Returns a list of unique column references
     :param col_refs:
@@ -116,16 +116,16 @@ def getUniqueColRefs(col_refs: List[ast.ColumnRef]):
     return col_refs
 
 
-def transformQuery(q, udf_name):
+def transform_query(q, udf_name):
     """
     Transforms a query into a batched form
     :param q:
     :return:
     """
     subquery = q[0].stmt
-    q[0].stmt = convertToSubquery(subquery)
+    q[0].stmt = convert_to_subquery(subquery)
     select_stmt = q[0].stmt
-    fn_calls = getFunctionCalls(q, udf_name)
+    fn_calls = get_function_calls(q, udf_name)
     inner_targets = []
     assert len(fn_calls) == 1
     fn_call = fn_calls[0]
