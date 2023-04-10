@@ -51,6 +51,9 @@ class Schema:
             columns = columns.union(self.get_columns_for_table(table))
         return columns
 
+    def get_primary_key(self, table):
+        return self.tables[table].primary_key
+
 
 class ProcBenchSchema(Schema):
     def __init__(self):
