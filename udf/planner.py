@@ -9,6 +9,7 @@ from pglast.stream import IndentedStream
 from pglast.visitors import Visitor, Skip
 import pydot
 
+from udf.planner_main import Planner
 from udf.schema import Schema, ProcBenchSchema
 from udf.utils import TEMP_TABLE_NAME
 
@@ -140,6 +141,17 @@ class SuffixAppender(Visitor):
     def visit_ColumnRef(self, parent, node: ast.ColumnRef):
         if node.fields and node.fields[-1].val in self.cols:
             node.fields[-1].val += self.suffix
+
+
+class CountStarRewriter(Visitor):
+    def __init__(self, pkey: str):
+        self.pkey = pkey
+
+    def visit_FuncCall(self, parent, node: ast.FuncCall):
+        # Replace count(*) with count(pkey)
+        if node.funcname[0].val.upper() == "COUNT" and node.agg_star:
+            node.agg_star = False
+            node.args = [ast.ColumnRef(fields=[ast.String(self.pkey)])]
 
 
 class Naming:
@@ -744,14 +756,14 @@ class Agg(Node):
 
             # Rewrite COUNT(*) -> COUNT(join.outer_table.pk)
             for i, target in enumerate(self.target_list):
-                if (
-                    isinstance(target, ast.ResTarget)
-                    and isinstance(target.val, ast.FuncCall)
-                    and target.val.funcname[0].val.upper() == "COUNT"
-                    and target.val.agg_star
-                ):
-                    target.val.args = (pkey_ref,)
-                    target.val.agg_star = False
+                CountStarRewriter(self.agg_pkey)(target)
+
+        for i, target in enumerate(self.target_list):
+            # Handle cases like ARRAY_AGG(x ORDER BY pkey), where we need to
+            # add the correct suffix to pkey
+            SuffixAppender(suffix, self.schema.get_columns_for_table(TEMP_TABLE_NAME))(
+                target
+            )
 
         parent_ast.groupClause = self.agg_keys
         parent_ast.targetList = self.target_list
@@ -818,175 +830,3 @@ class Result(Node):
         child_ast.intoClause = self.into
         EmptyTargetListFixer()(child_ast)
         return child_ast
-
-
-class Planner:
-    def __init__(self, schema: Schema):
-        self.schema = schema
-
-    def remove_laterals(self, query_str: str) -> str:
-        plan = self.plan_query(query_str)
-        plan.remove_dependent_joins()
-        graph = pydot.Dot(graph_type="digraph")
-        plan.visualize(graph)
-        graph.write_png("plan_flattened.png")
-        deparsed_ast = plan.deparse()
-        return IndentedStream()(deparsed_ast)
-
-    def plan_query(self, query_str: str):
-        select_stmt = parse_sql(query_str)[0].stmt
-
-        # Recursively plan the query
-        result = Result(
-            self.schema, self.plan_select(select_stmt), into=select_stmt.intoClause
-        )
-
-        graph = pydot.Dot(graph_type="digraph")
-        result.visualize(graph)
-        graph.write_png("plan_raw.png")
-
-        # Push down filters
-        result.push_down_filters()
-
-        # Visualization
-        graph = pydot.Dot(graph_type="digraph")
-        result.visualize(graph)
-        graph.write_png("plan.png")
-
-        # deparsed_ast = result.deparse()
-        # print(deparsed_ast)
-        # print(IndentedStream()(deparsed_ast))
-        return result
-
-    def plan_select(self, select_stmt: ast.SelectStmt) -> Node:
-        if select_stmt.op != SetOperation.SETOP_NONE:
-            left = self.plan_select(select_stmt.larg)
-            right = self.plan_select(select_stmt.rarg)
-            return SetOp(select_stmt, left, right)
-        # 1. FROM
-        if select_stmt.fromClause is None:
-            from_tables = []
-        else:
-            from_tables = [
-                self.plan_from_node(from_entry) for from_entry in select_stmt.fromClause
-            ]
-
-        # JOIN
-        if len(from_tables) > 0:
-            left_node = from_tables[0]
-            join_tables = list(zip(from_tables, select_stmt.fromClause))[1:]
-            for right_node, right_ast in join_tables:
-                if isinstance(right_ast, ast.RangeSubselect) and right_ast.lateral:
-                    left_node = DependentJoin(left_node, right_node, self.schema)
-                else:  # assume cross join, filter handled in WHERE clause
-                    left_node = Join(
-                        self.schema,
-                        right_ast,
-                        left_node,
-                        right_node,
-                        join_type=JoinType.JOIN_INNER,
-                    )
-            node = left_node
-        else:
-            # No FROM clause
-            node = None
-
-        # WHERE
-
-        if select_stmt.whereClause is not None:
-            if isinstance(select_stmt.whereClause, ast.BoolExpr):
-                assert select_stmt.whereClause.boolop == BoolExprType.AND_EXPR
-                for qual in select_stmt.whereClause.args:
-                    node = Filter(self.schema, qual, node)
-            else:
-                assert isinstance(select_stmt.whereClause, ast.A_Expr)
-                node = Filter(self.schema, select_stmt.whereClause, node)
-
-        # GROUP BY / Scalar aggregate
-        agg_targets = []
-        for target in select_stmt.targetList:
-            agg_finder = AggFinder()
-            agg_finder(target)
-            agg_targets.append(agg_finder.has_agg)
-
-        if select_stmt.groupClause is not None or any(agg_targets):
-            node = Agg(
-                self.schema,
-                select_stmt.targetList,
-                select_stmt.groupClause,
-                agg_targets,
-                node,
-            )
-        else:
-            # SELECT
-            assert (
-                select_stmt.targetList is not None and len(select_stmt.targetList) > 0
-            )
-            node = Project(self.schema, select_stmt.targetList, node)
-
-        # ORDER BY
-        if select_stmt.sortClause is not None:
-            node = OrderBy(self.schema, select_stmt.sortClause, node)
-
-        # LIMIT
-        if select_stmt.limitCount is not None:
-            node = Limit(self.schema, select_stmt, node)
-
-        return node
-
-    def plan_from_node(self, from_node):
-        if isinstance(from_node, ast.RangeVar):
-            return TableScan(self.schema, from_node)
-        elif isinstance(from_node, ast.RangeSubselect):
-            return self.plan_select(from_node.subquery)
-        elif isinstance(from_node, ast.JoinExpr):
-            left = self.plan_from_node(from_node.larg)
-            right = self.plan_from_node(from_node.rarg)
-            return Join(self.schema, from_node, left, right)
-        else:
-            raise NotImplementedError
-
-
-if __name__ == "__main__":
-    #     query = """SELECT ca_state
-    #      , d_year
-    #      , d_qoy
-    #      , totallargepurchases(ca_state, 1000, d_year, d_qoy)
-    # FROM customer_address, date_dim
-    # WHERE d_year IN (1998, 1999, 2000)
-    #   AND ca_state IS NOT NULL
-    # GROUP BY ca_state, d_year, d_qoy
-    # ORDER BY ca_state
-    #        , d_year
-    #        , d_qoy;"""
-
-    # query = """SELECT x FROM t1, LATERAL (SELECT k FROM t2 WHERE x = k) dt1"""
-
-    query = """SELECT ARRAY_AGG(agg_0)
-        INTO numsalesfromstore
-        
-        FROM temp
-           , LATERAL (SELECT COUNT(*) AS agg_0
-                      FROM store_sales_history
-                      WHERE (ss_customer_sk = ckey)
-                        AND (ss_sold_date_sk >= fromdatesk)
-                        AND (ss_sold_date_sk <= todatesk)) AS dt1"""
-
-    print(parse_sql(query))
-    print(IndentedStream()(parse_sql(query)[0].stmt))
-    schema = ProcBenchSchema()
-    # schema.add_table(
-    #     "temp",
-    #     {"manager": "varchar(40)", "yr": "int"},
-    # )
-    # schema.add_table(
-    #     "temp",
-    #     {"ckey": "int", "fromdatesk": "int", "todatesk": "int"},
-    # )
-    planner = Planner(schema)
-
-    plan = planner.plan_query(query)
-    plan.remove_dependent_joins()
-    deparsed_ast = plan.deparse()
-    print(deparsed_ast)
-    print(IndentedStream()(deparsed_ast))
