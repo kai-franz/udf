@@ -2,56 +2,14 @@ import copy
 from enum import Enum
 from pglast import *
 from pglast import ast, scan
-from pglast.enums import OnCommitAction
+from pglast.enums import OnCommitAction, ConstrType
 from pglast.stream import IndentedStream
 from pglast.visitors import Visitor
 from typing import List
 
 from udf.schema import Schema
-from udf.planner import Planner
-
-
-class BaseType(Enum):
-    INT = 1
-    DECIMAL = 2
-    FLOAT = 3
-    VARCHAR = 4
-    # handle cases like DECIMAL(10, 2)
-
-
-class Type:
-    def __init__(self, type_str: str):
-        self.type_str = type_str
-        if "(" in type_str:
-            base_type = type_str.split("(")[0]
-        else:
-            base_type = type_str
-        self.base_type = BaseType[base_type]
-
-    def __str__(self):
-        return self.type_str
-
-
-class Var:
-    def __init__(self, name: str, type: str):
-        self.name = name
-        self.type = Type(type)
-
-    def __str__(self):
-        return f"{self.name}: {self.type}"
-
-    def __repr__(self):
-        return self.__str__()
-
-
-class Param:
-    def __init__(self, param: ast.FunctionParameter):
-        self.name = param.name
-        self.type = param.argType
-
-
-indent = 4
-tab = " " * indent
+from udf.planner_main import Planner
+from udf.utils import *
 
 
 def split_assign(assign: str):
@@ -104,6 +62,7 @@ class FunctionBodyRewriter(Visitor):
         if node.defname == "as":
             return ast.DefElem(defname="as", arg=(ast.String(self.new_body),))
 
+
 class FromClauseFinder(Visitor):
     """
     Finds the FROM clause in a query.
@@ -115,6 +74,7 @@ class FromClauseFinder(Visitor):
     def visit_SelectStmt(self, parent, node: ast.SelectStmt):
         if node.fromClause:
             self.from_clause = True
+
 
 class UdfRewriter:
     def __init__(self, f: str, schema: Schema, remove_laterals=False):
@@ -209,9 +169,16 @@ class UdfRewriter:
         for param in self.params:
             column = ast.ColumnDef(colname=param.name, typeName=param.type)
             temp_table_cols.append(column)
+        temp_table_cols.append(
+            ast.ColumnDef(
+                colname=TEMP_KEY_NAME,
+                typeName=ast.TypeName(names=[ast.String("serial")]),
+                constraints=(ast.Constraint(contype=ConstrType.CONSTR_PRIMARY),),
+            )
+        )
         create_table_stmt = ast.CreateStmt(
             relation=ast.RangeVar(
-                relname="temp",
+                relname=TEMP_TABLE_NAME,
                 inh=True,
                 relpersistence="t",
             ),
@@ -284,9 +251,10 @@ class UdfRewriter:
     def put_stmt(self, stmt, block):
         if "PLpgSQL_stmt_assign" in stmt:
             sql = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
-            print(stmt["PLpgSQL_stmt_assign"])
             lhs = self.vars[stmt["PLpgSQL_stmt_assign"]["varno"]]
-            block.append(lhs.name + "[i] := (" + self.rewrite_query_inside_loop(sql) + ");")
+            block.append(
+                lhs.name + "[i] := (" + self.rewrite_query_inside_loop(sql) + ");"
+            )
         elif "PLpgSQL_stmt_execsql" in stmt:
             block.append(stmt["PLpgSQL_stmt_execsql"])
         elif "PLpgSQL_stmt_if" in stmt:
@@ -370,6 +338,9 @@ class UdfRewriter:
             func_call = ast.FuncCall(
                 funcname=(ast.String("array_agg"),),
                 args=(ast.RangeVar(relname=f"agg_{i}", inh=True),),
+                agg_order=(
+                    ast.SortBy(node=ast.ColumnRef(fields=(ast.String(TEMP_KEY_NAME),))),
+                ),
             )
             array_agg = ast.ResTarget(val=func_call)
             array_aggs.append(array_agg)
@@ -407,13 +378,16 @@ class UdfRewriter:
         because this makes it much slower.
         """
         real_query = any(
-            token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM" for token
-            in tokens)
+            token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM"
+            for token in tokens
+        )
         if not real_query:
             first_token = tokens[0]
             assert (
-                        first_token.kind == "RESERVED_KEYWORD" and first_token.name.upper() == "SELECT")
-            new_query = new_query[len("SELECT "):]
+                first_token.kind == "RESERVED_KEYWORD"
+                and first_token.name.upper() == "SELECT"
+            )
+            new_query = new_query[len("SELECT ") :]
         return new_query
 
     def get_local_var_names(self):
@@ -430,7 +404,6 @@ class UdfRewriter:
         making scalar parameters into arrays.
         """
         for param in self.sql_tree.parameters:
-            print(param)
             param.argType = copy.copy(param.argType)
             param.argType.arrayBounds = [ast.Integer(-1)]
             param.name = param.name + "_batch"
