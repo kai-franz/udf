@@ -9,7 +9,6 @@ from pglast.stream import IndentedStream
 from pglast.visitors import Visitor, Skip
 import pydot
 
-from udf.planner_main import Planner
 from udf.schema import Schema, ProcBenchSchema
 from udf.utils import TEMP_TABLE_NAME
 
@@ -94,7 +93,7 @@ class AggFinder(Visitor):
         self.has_agg = False
 
     def visit_FuncCall(self, parent, node: ast.FuncCall):
-        if node.funcname and node.funcname[-1].val in AGG_FUNCS:
+        if node.funcname and node.funcname[-1].val.upper() in AGG_FUNCS:
             self.has_agg = True
 
     def visit_SelectStmt(self, parent, node: ast.SelectStmt):
@@ -614,27 +613,36 @@ class Join(Node):
         quals = self.quals
         l_suffix = self.left().get_suffix()
         r_suffix = self.right().get_suffix()
-        for col in self.deferred_quals:
-            qual_expr = ast.A_Expr(
-                kind=A_Expr_Kind.AEXPR_OP,
-                name=[ast.String("=")],
-                lexpr=ast.ColumnRef(
-                    fields=[
-                        # ast.String(self.left().alias),
-                        ast.String(col + l_suffix),
-                        # implement suffix propagation
-                    ],
-                    location=-1,
-                ),
-                rexpr=ast.ColumnRef(
-                    fields=[
-                        ast.String(self.right().alias),
-                        ast.String(col + r_suffix),
-                    ],
-                    location=-1,
-                ),
-            )
-            quals = add_to_quals(quals, qual_expr)
+        if l_suffix is not None and r_suffix is not None:
+            for col in self.deferred_quals:
+                qual_expr = ast.A_Expr(
+                    kind=A_Expr_Kind.AEXPR_OP,
+                    name=[ast.String("=")],
+                    lexpr=ast.ColumnRef(
+                        fields=[
+                            # ast.String(self.left().alias),
+                            ast.String(col + l_suffix),
+                            # implement suffix propagation
+                        ],
+                        location=-1,
+                    ),
+                    rexpr=ast.ColumnRef(
+                        fields=[
+                            ast.String(self.right().alias),
+                            ast.String(col + r_suffix),
+                        ],
+                        location=-1,
+                    ),
+                )
+                quals = add_to_quals(quals, qual_expr)
+        elif l_suffix is not None:
+            self.join_type = JoinType.JOIN_LEFT
+        elif r_suffix is not None:
+            self.join_type = JoinType.JOIN_RIGHT
+        else:
+            # The outer relation of the dependent join ended up getting eliminated in
+            # both sides of the join, so we can just use a regular inner join here.
+            pass
         return ast.JoinExpr(
             jointype=self.join_type,
             larg=left_ast,
@@ -710,7 +718,7 @@ class Join(Node):
             return left_suffix
         if right_suffix is not None:
             return right_suffix
-        return None
+        return None  # TODO(kai): fix
 
 
 class Agg(Node):
