@@ -91,6 +91,9 @@ def new_array_agg(col_refs: List):
     :param col_refs:
     :return:
     """
+    for col_ref in col_refs:
+        if len(col_ref.fields) > 1:
+            col_ref.fields = [col_ref.fields[-1]]
     sort_by = []
     for col_ref in col_refs:
         sort_by.append(
@@ -104,7 +107,7 @@ def new_array_agg(col_refs: List):
     targetlist = []
     for col_ref in col_refs:
         if isinstance(col_ref, ast.ColumnRef):
-            batched_alias = col_ref.fields[0].val + "_batch"
+            batched_alias = col_ref.fields[-1].val + "_batch"
         elif isinstance(col_ref, ast.A_Const):
             batched_alias = str(col_ref.val.val) + "_batch"
         else:
@@ -225,15 +228,15 @@ def transform_query(q, udf_name):
         alias = None
         # The UDF call. Change this to unnest the batched version of the function.
         if isinstance(val, ast.FuncCall):
-            alias = val.funcname[0].val
-            val.funcname = [ast.String(val.funcname[0].val + "_batch")]
+            alias = val.funcname[-1].val
+            val.funcname = [ast.String(val.funcname[-1].val + "_batch")]
             new_args = []
             for arg in val.args:
-                if isinstance(arg, ast.FuncCall) and arg.funcname[0].val == udf_name:
+                if isinstance(arg, ast.FuncCall) and arg.funcname[-1].val == udf_name:
                     continue
                 if isinstance(arg, ast.ColumnRef):
                     new_args.append(
-                        ast.ColumnRef([ast.String(arg.fields[0].val + "_batch")])
+                        ast.ColumnRef([ast.String(arg.fields[-1].val + "_batch")])
                     )
                 elif isinstance(arg, ast.A_Const):
                     new_args.append(ast.ColumnRef([str(arg.val.val) + "_batch"]))
