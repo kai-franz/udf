@@ -329,6 +329,7 @@ class UdfRewriter:
                 token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM"
                 for token in tokens
             )
+            query = query[len("SELECT ") :]
             if real_query:
                 batched_sql = self.batch_query(query).split("\n")
                 varno = stmt["PLpgSQL_stmt_assign"]["varno"]
