@@ -288,16 +288,56 @@ class UdfRewriter:
             raise Exception("Unknown statement type: " + str(stmt))
 
     def put_stmt_toplevel(self, stmt, block):
+        """
+        TODO(kai): Should rewrite SELECT .. into x -> x := SELECT ..
+        for performance reasons
+        :param stmt:
+        :param block:
+        :return:
+        """
         if "PLpgSQL_stmt_execsql" in stmt:
-            self.put_batched_sql(stmt["PLpgSQL_stmt_execsql"], block)
+            query = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["PLpgSQL_expr"]["query"]
+            tokens = scan(query)
+            real_query = any(
+                token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM"
+                for token in tokens
+            )
+            if real_query:
+                self.put_batched_sql(stmt["PLpgSQL_stmt_execsql"], block)
+            else:
+                query_ast = parse_sql(query)
+                select_stmt = query_ast[0].stmt
+                assert select_stmt.intoClause is not None
+                var_name = select_stmt.intoClause.rel.relname
+                select_stmt.intoClause = None
+                varno = self.get_varno(var_name)
+                self.put_looped_stmt(
+                    {
+                        "PLpgSQL_stmt_assign": {
+                            "varno": varno,
+                            "expr": {
+                                "PLpgSQL_expr": {"query": IndentedStream()(query)}
+                            },
+                        }
+                    },
+                    block,
+                )
         elif "PLpgSQL_stmt_assign" in stmt:
-            assign_stmt = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
-            batched_sql = self.batch_query(assign_stmt).split("\n")
-            varno = stmt["PLpgSQL_stmt_assign"]["varno"]
-            batched_sql[0] = "(" + batched_sql[0]
-            batched_sql[-1] = batched_sql[-1] + ");"
-            batched_sql[0] = gen_assign_stmt(self.vars[varno].name, batched_sql[0])
-            block += batched_sql
+            query = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
+            tokens = scan(query)
+            real_query = any(
+                token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM"
+                for token in tokens
+            )
+            if real_query:
+                batched_sql = self.batch_query(query).split("\n")
+                varno = stmt["PLpgSQL_stmt_assign"]["varno"]
+                batched_sql[0] = "(" + batched_sql[0]
+                batched_sql[-1] = batched_sql[-1] + ");"
+                batched_sql[0] = gen_assign_stmt(self.vars[varno].name, batched_sql[0])
+                block += batched_sql
+            else:
+                self.put_looped_stmt(stmt, block)
         else:
             self.put_looped_stmt(stmt, block)
 
@@ -418,3 +458,9 @@ class UdfRewriter:
         # Change the function name
         self.original_func_name = self.sql_tree.funcname[0].val
         self.sql_tree.funcname = [ast.String(self.sql_tree.funcname[0].val + "_batch")]
+
+    def get_varno(self, var_name):
+        for varno, var in self.vars.items():
+            if var.name == var_name:
+                return varno
+        raise Exception(f"Could not find varno for {var_name}")
