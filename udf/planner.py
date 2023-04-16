@@ -93,7 +93,7 @@ class AggFinder(Visitor):
         self.has_agg = False
 
     def visit_FuncCall(self, parent, node: ast.FuncCall):
-        if node.funcname and node.funcname[-1].val.upper() in AGG_FUNCS:
+        if node.funcname and node.funcname[-1].val.lower() in AGG_FUNCS:
             self.has_agg = True
 
     def visit_SelectStmt(self, parent, node: ast.SelectStmt):
@@ -520,11 +520,12 @@ class Filter(Node):
             self.child().deparse(), self.child().get_order()
         )
         child_ast = self.construct_subselect(child_ast)
-
+        print("Deparsing filter: ", IndentedStream()(self.predicate))
         if child_ast.whereClause is not None:
             if isinstance(child_ast.whereClause, ast.A_Expr):
                 child_ast.whereClause = ast.BoolExpr(
-                    boolop=BoolExprType.AND_EXPR, args=[child_ast.whereClause]
+                    boolop=BoolExprType.AND_EXPR,
+                    args=[child_ast.whereClause, self.predicate],
                 )
             else:
                 assert isinstance(child_ast.whereClause, ast.BoolExpr)
@@ -546,7 +547,7 @@ class Filter(Node):
             return self.child().push_down_dependent_join(join)
         else:
             print("Filter is NOT dependent: ", IndentedStream()(self.predicate))
-            self.child().push_down_dependent_join(join)
+            self.children[0] = self.child().push_down_dependent_join(join)
             return self
 
 
@@ -586,6 +587,10 @@ class Project(Node):
             child.push_down_dependent_join(join) for child in self.children
         ]
         return self
+
+    def get_suffix(self):
+        if len(self.children) == 0:
+            return ""
 
 
 class Join(Node):
@@ -653,6 +658,25 @@ class Join(Node):
         )
 
     def push_down_dependent_join(self, join: DependentJoin):
+        if (
+            join.join_type == JoinType.JOIN_LEFT
+            or join.join_type == JoinType.JOIN_RIGHT
+        ):
+            # We can't push a left dependent join through a join, so we will place it
+            # above this join.
+            assert len(join.quals) > 0
+            qual_expr = ast.BoolExpr(boolop=BoolExprType.AND_EXPR, args=join.quals)
+            dependent_cols = join.get_outer_cols()
+            SuffixAppender(join.left().get_suffix(), dependent_cols)(qual_expr)
+            ast_node = ast.JoinExpr(
+                jointype=join.join_type,
+                isNatural=False,
+                larg=None,
+                rarg=None,
+                quals=qual_expr,
+            )
+            return Join(self.schema, ast_node, join.left(), self)
+
         dependent_quals = join.quals
         join.quals = []
         left_join_side, right_join_side = copy.deepcopy(join), copy.deepcopy(join)
