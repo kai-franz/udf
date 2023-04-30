@@ -2,7 +2,7 @@ import copy
 from enum import Enum
 from pglast import *
 from pglast import ast, scan
-from pglast.enums import OnCommitAction, ConstrType, A_Expr_Kind
+from pglast.enums import OnCommitAction, ConstrType, A_Expr_Kind, SubLinkType
 from pglast.stream import IndentedStream
 from pglast.visitors import Visitor
 from typing import List
@@ -527,8 +527,17 @@ class UdfRewriter:
             target.name = target_aggs[i]
 
         subselect = ast.RangeSubselect(
-            lateral=True, subquery=select_stmt, alias=ast.Alias("dt1")
+            lateral=False,
+            subquery=select_stmt,
+            # alias=ast.Alias(f"agg_0")
+            # TODO: fix hardcoded alias
         )
+        sublink = ast.SubLink(
+            subLinkType=SubLinkType.EXPR_SUBLINK,
+            subLinkId=0,
+            subselect=subselect,
+        )
+        sublink_target = ast.ResTarget(name="agg_0", val=sublink)
         temp_table = ast.RangeVar(relname="temp", inh=True)
 
         array_aggs = []
@@ -543,9 +552,24 @@ class UdfRewriter:
             array_agg = ast.ResTarget(val=func_call)
             array_aggs.append(array_agg)
 
-        new_query = ast.SelectStmt(
-            targetList=tuple(array_aggs), fromClause=(temp_table, subselect)
+        inner_select = ast.SelectStmt(
+            targetList=(
+                ast.ResTarget(val=ast.ColumnRef(fields=(ast.String(TEMP_KEY_NAME),))),
+                sublink_target,
+            ),
+            fromClause=(temp_table,),
         )
+
+        new_query = ast.SelectStmt(
+            targetList=tuple(array_aggs),
+            fromClause=(
+                ast.RangeSubselect(
+                    lateral=False, subquery=inner_select, alias=ast.Alias("dt0")
+                ),
+            ),
+        )
+
+        print("new_query: ", new_query)
 
         if into is not None:
             new_query.intoClause = self.generate_into_clause(into)
