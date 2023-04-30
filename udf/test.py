@@ -6,13 +6,16 @@
 
 from rewriter import Rewriter
 import sys
+import time
 
 query_input_dir = sys.argv[1]
 udf_input_dir = sys.argv[2]
 output_dir = sys.argv[3]
 
-udfs = [1] # [1, 5, 6, 7, 13]  # 12
+udfs = [1, 5, 6, 7, 12, 13]
 files = [f"sudf_{udf}.sql" for udf in udfs]
+
+rewriting_times = []
 
 
 def rewrite_query(query_file_name, udf_file_name, output_file_name):
@@ -21,7 +24,11 @@ def rewrite_query(query_file_name, udf_file_name, output_file_name):
         query = query_file.read()
     with open(udf_file_name, "r") as udf_file:
         udf = udf_file.read()
-    r = Rewriter(query, udf, remove_laterals=True)
+    before_time = time.time()
+    for i in range(100):
+        r = Rewriter(query, udf, remove_laterals=True)
+    after_time = time.time()
+    rewriting_times.append(after_time - before_time)
     with open(output_file_name, "w") as out_file:
         out_file.write(r.new_udf())
         out_file.write("\n\n\n")
@@ -32,3 +39,5 @@ for file in files:
     rewrite_query(
         f"{query_input_dir}/{file}", f"{udf_input_dir}/{file}", f"{output_dir}/{file}"
     )
+
+print("Rewriting times:", rewriting_times)
