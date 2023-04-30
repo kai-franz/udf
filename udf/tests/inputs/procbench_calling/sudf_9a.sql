@@ -1,0 +1,1 @@
+SELECT wealth_shipcostcorrelation_cat();

@@ -1,0 +1,1 @@
+SELECT maxpromochannel(2001);
