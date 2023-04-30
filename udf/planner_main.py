@@ -19,6 +19,8 @@ from udf.planner import (
 )
 from udf.schema import Schema
 
+VISUALIZE = False
+
 
 class Planner:
     def __init__(self, schema: Schema):
@@ -27,9 +29,11 @@ class Planner:
     def remove_laterals(self, query_str: str) -> str:
         plan = self.plan_query(query_str)
         plan.remove_dependent_joins()
-        graph = pydot.Dot(graph_type="digraph")
-        plan.visualize(graph)
-        graph.write_png("plan_flattened.png")
+
+        if VISUALIZE:
+            graph = pydot.Dot(graph_type="digraph")
+            plan.visualize(graph)
+            graph.write_png("plan_flattened.png")
         deparsed_ast = plan.deparse()
         return IndentedStream()(deparsed_ast)
 
@@ -41,17 +45,19 @@ class Planner:
             self.schema, self.plan_select(select_stmt), into=select_stmt.intoClause
         )
 
-        graph = pydot.Dot(graph_type="digraph")
-        result.visualize(graph)
-        graph.write_png("plan_raw.png")
+        if VISUALIZE:
+            graph = pydot.Dot(graph_type="digraph")
+            result.visualize(graph)
+            graph.write_png("plan_raw.png")
 
         # Push down filters
-        result.push_down_filters()
+        # result.push_down_filters()
 
         # Visualization
-        graph = pydot.Dot(graph_type="digraph")
-        result.visualize(graph)
-        graph.write_png("plan.png")
+        if VISUALIZE:
+            graph = pydot.Dot(graph_type="digraph")
+            result.visualize(graph)
+            graph.write_png("plan.png")
 
         # deparsed_ast = result.deparse()
         # print(deparsed_ast)
@@ -108,8 +114,9 @@ class Planner:
             agg_finder = AggFinder()
             agg_finder(target)
             agg_targets.append(agg_finder.has_agg)
-
+        # print("Current target list:", select_stmt.targetList)
         if select_stmt.groupClause is not None or any(agg_targets):
+            # print("Planning aggregate")
             node = Agg(
                 self.schema,
                 select_stmt.targetList,
@@ -123,6 +130,7 @@ class Planner:
                 select_stmt.targetList is not None and len(select_stmt.targetList) > 0
             )
             node = Project(self.schema, select_stmt.targetList, node)
+            # print("Planning projection")
 
         # ORDER BY
         if select_stmt.sortClause is not None:

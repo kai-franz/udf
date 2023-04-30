@@ -14,7 +14,7 @@ class Rewriter:
             udf, self.schema, remove_laterals=remove_laterals
         )
         self.root_q = parse_sql(query)
-        transformQuery(self.root_q, self.udf_rewriter.original_func_name)
+        transform_query(self.root_q, self.udf_rewriter.original_func_name)
 
     def new_query(self):
         return IndentedStream()(self.root_q)

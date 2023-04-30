@@ -39,7 +39,6 @@ class Param:
     def __init__(self, param: ast.FunctionParameter):
         self.name = param.name
         self.type = param.argType
-        print(param)
 
 
 indent = 4

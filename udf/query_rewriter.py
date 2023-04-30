@@ -31,7 +31,7 @@ def get_function_calls(parseTree, udf_name):
         function_calls = []
 
         def visit_FuncCall(self, parent, node):
-            print(node.funcname)
+            # print(node.funcname)
             if node.funcname[-1].val == udf_name:
                 self.function_calls.append(node)
 
@@ -92,7 +92,7 @@ def new_array_agg(col_refs: List):
     :return:
     """
     for col_ref in col_refs:
-        if len(col_ref.fields) > 1:
+        if isinstance(col_ref, ast.ColumnRef) and len(col_ref.fields) > 1:
             col_ref.fields = [col_ref.fields[-1]]
     sort_by = []
     for col_ref in col_refs:
@@ -163,7 +163,7 @@ def transform_query(q, udf_name):
     :param q:
     :return:
     """
-    print(udf_name)
+    # print(udf_name)
     subquery = q[0].stmt
     q[0].stmt = convert_to_subquery(subquery)
     select_stmt = q[0].stmt
@@ -174,7 +174,7 @@ def transform_query(q, udf_name):
         fn_calls = get_function_calls(subquery.whereClause, udf_name)
         if len(fn_calls) > 0:
             assert len(fn_calls) == 1
-            print("UDF in where clause")
+            # print("UDF in where clause")
             # UDF in the where clause. We need to move it to the select clause.
             # Then, at the end, we'll add the where clause back in.
             udf_in_where_clause = True
@@ -183,31 +183,24 @@ def transform_query(q, udf_name):
                 ast.ResTarget(val=fn_calls[0]),
             )
             fn_calls[0] = select_stmt.targetList[-1]
-            print(select_stmt.targetList)
+            # print(select_stmt.targetList)
             FunctionCallSplitter(udf_name)(udf_clause)
-            print("udf clause:", udf_clause)
+            # print("udf clause:", udf_clause)
 
-    print(select_stmt.targetList)
+    # print(select_stmt.targetList)
     fn_calls = get_function_calls(q, udf_name)
     if len(fn_calls) == 0:
         # No UDFs. Just return.
-        raise Exception("No UDFs found")
-        # return
+        return
+
+    # For now, we only support one UDF per query.
     assert len(fn_calls) == 1
 
     inner_targets = []
     fn_call = fn_calls[0]
     fn_call_args = fn_call.args
-    print(select_stmt)
+    # print(select_stmt)
 
-    # for target in select_stmt.targetList:
-    #     if not (
-    #         isinstance(target.val, ast.FuncCall)
-    #         and target.val.funcname[0].val == udf_name
-    #     ):
-    #         col_refs.append(target.val)
-    # print(inner_targets)
-    # col_refs = getUniqueColRefs(col_refs)
     unnest_target_list = copy.deepcopy(select_stmt.targetList)
     select_stmt.targetList = new_array_agg(list(inner_targets) + list(fn_call_args))
 
@@ -216,7 +209,8 @@ def transform_query(q, udf_name):
         target
         for target in copy.deepcopy(unnest_target_list)
         if not (
-            isinstance(target.val, ast.FuncCall) and target.val.funcname[-1] == udf_name
+            isinstance(target.val, ast.FuncCall)
+            and target.val.funcname[-1].val.lower() == udf_name.lower()
         )
     ]
     # Construct unnest_target_list, which is the target list for the outer query.
@@ -263,13 +257,13 @@ def transform_query(q, udf_name):
                 funcname=[ast.String("unnest")],
                 args=[ast.ColumnRef(["_batch"])],
             )
-            alias = "unknown"
             raise Exception("Not implemented")
         if alias is not None:
             outer_target_list_for_where_clause.append(
                 ast.ResTarget(val=ast.ColumnRef([alias]))
             )
     subquery.targetList = inner_target_list
+    # print("Inner target list:", inner_target_list)
     # push down the select statement into a subquery
     subselect = ast.RangeSubselect(
         lateral=False, subquery=select_stmt, alias=ast.Alias("dt2")

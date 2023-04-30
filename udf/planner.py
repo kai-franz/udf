@@ -520,7 +520,7 @@ class Filter(Node):
             self.child().deparse(), self.child().get_order()
         )
         child_ast = self.construct_subselect(child_ast)
-        print("Deparsing filter: ", IndentedStream()(self.predicate))
+        # print("Deparsing filter: ", IndentedStream()(self.predicate))
         if child_ast.whereClause is not None:
             if isinstance(child_ast.whereClause, ast.A_Expr):
                 child_ast.whereClause = ast.BoolExpr(
@@ -542,11 +542,11 @@ class Filter(Node):
         dependency_checker = DependentFilterChecker({outer_rel.table}, join.schema)
         dependency_checker(self.predicate)
         if dependency_checker.is_dependent:
-            print("Filter is dependent:", IndentedStream()(self.predicate))
+            # print("Filter is dependent:", IndentedStream()(self.predicate))
             join.quals.append(self.predicate)
             return self.child().push_down_dependent_join(join)
         else:
-            print("Filter is NOT dependent: ", IndentedStream()(self.predicate))
+            # print("Filter is NOT dependent: ", IndentedStream()(self.predicate))
             self.children[0] = self.child().push_down_dependent_join(join)
             return self
 
@@ -684,17 +684,17 @@ class Join(Node):
         right_join_side.left().alias = Naming.next_alias(right_join_side.left().table)
         for qual in dependent_quals:
             qual_refs = get_col_refs(qual) - join.get_outer_cols()
-            print("qual_refs: ", qual_refs)
+            # print("qual_refs: ", qual_refs)
             if self.left().cols.issuperset(qual_refs):
-                print("moving to left side")
+                # print("moving to left side")
                 left_join_side.quals.append(qual)
             elif self.right().cols.issuperset(qual_refs):
-                print("moving to right side")
+                # print("moving to right side")
                 right_join_side.quals.append(qual)
             elif self.cols.issuperset(qual_refs):
-                print(qual)
-                print("left cols: ", self.left().cols)
-                print("right cols: ", self.right().cols)
+                # print(qual)
+                # print("left cols: ", self.left().cols)
+                # print("right cols: ", self.right().cols)
                 raise Exception("Qual not pushed down to either side of join.")
             else:
                 raise Exception("Qual discarded.")
@@ -710,22 +710,22 @@ class Join(Node):
         # filter_cols = col_finder.cols.difference(
         #     self.schema.get_columns_for_table("temp")
         # )
-        print("Pushing down filter:", IndentedStream()(filter_node.predicate))
+        # print("Pushing down filter:", IndentedStream()(filter_node.predicate))
         if filter_cols.issubset(self.left().cols):
-            print("Putting filter on left")
+            # print("Putting filter on left")
             self.children[0] = self.left().push_down_filter(filter_node)
         elif filter_cols.issubset(self.right().cols):
-            print("Putting filter on right")
+            # print("Putting filter on right")
             self.children[1] = self.right().push_down_filter(filter_node)
         elif filter_cols.issubset(self.cols):
             # Filter is a join predicate.
-            print("Putting filter on join")
+            # print("Putting filter on join")
             # print("filter_cols: ", filter_cols)
             # print("left cols: ", self.left().cols)
             # print("right cols: ", self.right().cols)
             self.quals = add_to_quals(self.quals, filter_node.predicate)
         else:
-            print("Putting filter above join")
+            # print("Putting filter above join")
             # print("filter_cols: ", filter_cols)
             # print("left cols: ", self.left().cols)
             # print("right cols: ", self.right().cols)
