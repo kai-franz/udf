@@ -211,16 +211,10 @@ class UdfRewriter:
         for param in self.params:
             column = ast.ColumnDef(colname=param.name, typeName=param.type)
             temp_table_cols.append(column)
-        for var_name in sorted(list(self.local_var_refs)):
-            var_type = None
-            for var in self.vars.values():
-                if var.name == var_name:
-                    var_type = var.type
-            if var_type is None:
-                raise Exception(f"Could not find type for variable {var_name}")
+        for var in list(self.vars.values()):
             column = ast.ColumnDef(
-                colname=var_name + "_scalar",
-                typeName=ast.TypeName(names=(ast.String(str(var_type).lower()),)),
+                colname=var.name,
+                typeName=ast.TypeName(names=(ast.String(str(var.type).lower()),)),
             )
             temp_table_cols.append(column)
         temp_table_cols.append(
