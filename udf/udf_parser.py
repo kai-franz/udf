@@ -15,14 +15,31 @@ class UdfStmt:
 
 
 class AssignStmt(UdfStmt):
-    def __init__(self, stmt):
-        self.sql = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
-        self.varno = stmt["PLpgSQL_stmt_assign"]["varno"]
+    def __init__(self, sql, varno):
+        self.sql = sql
+        self.varno = varno
+
+    @classmethod
+    def from_dict(cls, stmt):
+        return cls(
+            stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"],
+            stmt["PLpgSQL_stmt_assign"]["varno"],
+        )
 
 
 class ExecSqlStmt(UdfStmt):
     def __init__(self, stmt):
-        self.sql = stmt["PLpgSQL_stmt_execsql"]
+        self.sql = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["PLpgSQL_expr"]["query"]
+        if "target" in stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]:
+            self.into = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["target"][
+                "PLpgSQL_row"
+            ]["fields"][-1]["name"]
+        else:
+            self.into = None
+
+    @classmethod
+    def from_dict(cls, stmt):
+        return cls(stmt)
 
 
 class IfStmt(UdfStmt):
@@ -41,6 +58,10 @@ class IfStmt(UdfStmt):
         else:
             self.else_body = None
 
+    @classmethod
+    def from_dict(cls, stmt):
+        return cls(stmt)
+
 
 class ReturnStmt(UdfStmt):
     def __init__(self, stmt):
@@ -49,6 +70,10 @@ class ReturnStmt(UdfStmt):
         else:
             self.sql = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
 
+    @classmethod
+    def from_dict(cls, stmt):
+        return cls(stmt)
+
 
 def parse_stmt(stmt):
     """
@@ -56,13 +81,13 @@ def parse_stmt(stmt):
     """
 
     if "PLpgSQL_stmt_assign" in stmt:
-        return AssignStmt(stmt)
+        return AssignStmt.from_dict(stmt)
     elif "PLpgSQL_stmt_execsql" in stmt:
-        return ExecSqlStmt(stmt)
+        return ExecSqlStmt.from_dict(stmt)
     elif "PLpgSQL_stmt_if" in stmt:
-        return IfStmt(stmt)
+        return IfStmt.from_dict(stmt)
     elif "PLpgSQL_stmt_return" in stmt:
-        return ReturnStmt(stmt)
+        return ReturnStmt.from_dict(stmt)
 
     raise Exception(f"Unknown statement type: {stmt}")
 

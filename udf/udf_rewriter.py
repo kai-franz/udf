@@ -9,6 +9,7 @@ from typing import List
 
 from udf.schema import Schema
 from udf.planner_main import Planner
+from udf.udf_parser import Udf, UdfStmt, AssignStmt, ExecSqlStmt, IfStmt, ReturnStmt
 from udf.utils import *
 
 
@@ -119,8 +120,8 @@ class UdfRewriter:
         self.out = []  # (nested) list of statements to output
         self.schema = schema
         self.remove_laterals = remove_laterals
+        self.udf_object = Udf(f)
         self.sql_tree = parse_sql(f)[0].stmt
-        self.tree = parse_plpgsql(f)[0]["PLpgSQL_function"]
         self.params = [Param(param) for param in self.sql_tree.parameters]
 
         self.rewrite_header()
@@ -149,13 +150,7 @@ class UdfRewriter:
         Parses the variables declared in the function and stores them in self.vars.
         :return:
         """
-        for varno, node in enumerate(self.tree["datums"]):
-            if "PLpgSQL_var" not in node:
-                continue
-            var = node["PLpgSQL_var"]
-            var_type = var["datatype"]["PLpgSQL_type"]["typname"]
-            if var_type != "UNKNOWN":
-                self.vars[varno] = Var(var["refname"], var_type)
+        self.vars = self.udf_object.vars
 
     def flatten_program(self, prog) -> List[str]:
         """
@@ -194,10 +189,8 @@ class UdfRewriter:
         :param stmt: PL/pgSQL AST for a SQL statement inside a UDF
         :param block: List of statements to append output to
         """
-        # Make sure we are only SELECTing into one variable
-        assert len(stmt["target"]["PLpgSQL_row"]["fields"]) == 1
-        query_str = stmt["sqlstmt"]["PLpgSQL_expr"]["query"]
-        into_var = stmt["target"]["PLpgSQL_row"]["fields"][0]["name"]
+        query_str = stmt.sql
+        into_var = stmt.into
         batched_query = self.batch_query(query_str, into=into_var).split("\n")
         batched_query[-1] += ";"
         block += batched_query
@@ -255,7 +248,7 @@ class UdfRewriter:
         block += (IndentedStream()(insert_stmt) + ";").split("\n")
 
         self.put_block(
-            self.tree["action"]["PLpgSQL_stmt_block"]["body"],
+            self.udf_object.body,
             self.out,
             header=block,
             footer="RETURN ret_vals;",
@@ -273,7 +266,12 @@ class UdfRewriter:
         block.append("END LOOP;")
 
     def put_block(
-        self, tree: list, super_block, header=None, footer=None, top_level=False
+        self,
+        tree: List[UdfStmt],
+        super_block,
+        header=None,
+        footer=None,
+        top_level=False,
     ):
         """
         Takes in a list of statements, creates a block containing these statements,
@@ -297,26 +295,25 @@ class UdfRewriter:
             block.append(footer)
         super_block.append(block)
 
-    def put_stmt(self, stmt, block):
-        if "PLpgSQL_stmt_assign" in stmt:
-            sql = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
-            lhs = self.vars[stmt["PLpgSQL_stmt_assign"]["varno"]]
+    def put_stmt(self, stmt: UdfStmt, block):
+        if isinstance(stmt, AssignStmt):
+            lhs = self.udf_object.vars[stmt.varno]
             block.append(
-                lhs.name + "[i] := (" + self.rewrite_query_inside_loop(sql) + ");"
+                lhs.name + "[i] := (" + self.rewrite_query_inside_loop(stmt.sql) + ");"
             )
-        elif "PLpgSQL_stmt_execsql" in stmt:
-            block.append(stmt["PLpgSQL_stmt_execsql"])
-        elif "PLpgSQL_stmt_if" in stmt:
-            sql = stmt["PLpgSQL_stmt_if"]["cond"]["PLpgSQL_expr"]["query"]
+        elif isinstance(stmt, ExecSqlStmt):
+            block.append(stmt.sql)
+        elif isinstance(stmt, IfStmt):
+            sql = stmt.sql
             block.append("IF (" + self.rewrite_query_inside_loop(sql) + ") THEN")
-            if "then_body" in stmt["PLpgSQL_stmt_if"]:
-                self.put_block(stmt["PLpgSQL_stmt_if"]["then_body"], block)
-            if "else_body" in stmt["PLpgSQL_stmt_if"]:
+            if stmt.then_body is not None:
+                self.put_block(stmt.then_body, block)
+            if stmt.else_body is not None:
                 block.append("ELSE")
-                self.put_block(stmt["PLpgSQL_stmt_if"]["else_body"], block)
+                self.put_block(stmt.else_body, block)
             block.append("END IF;")
-        elif "PLpgSQL_stmt_return" in stmt:
-            if "expr" not in stmt["PLpgSQL_stmt_return"]:
+        elif isinstance(stmt, ReturnStmt):
+            if stmt.sql is None:
                 # Implicit return, e.g.
                 # IF () THEN ... RETURN x; ELSE ... RETURN y; END IF;
                 # <implicit return>
@@ -324,11 +321,12 @@ class UdfRewriter:
                 # We don't codegen anything in this case.
                 return
 
-            sql = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
             block.append("IF returned[i] IS NULL THEN")
             block.append(
                 [
-                    "ret_vals[i] := (" + self.rewrite_query_inside_loop(sql) + ");",
+                    "ret_vals[i] := ("
+                    + self.rewrite_query_inside_loop(stmt.sql)
+                    + ");",
                     "returned[i] := TRUE;",
                 ]
             )
@@ -336,7 +334,7 @@ class UdfRewriter:
         else:
             raise Exception("Unknown statement type: " + str(stmt))
 
-    def put_stmt_toplevel(self, stmt, block):
+    def put_stmt_toplevel(self, stmt: UdfStmt, block):
         """
         TODO(kai): Should rewrite SELECT .. into x -> x := SELECT ..
         for performance reasons
@@ -344,9 +342,8 @@ class UdfRewriter:
         :param block:
         :return:
         """
-        if "PLpgSQL_stmt_execsql" in stmt:
-            substmt = stmt["PLpgSQL_stmt_execsql"]
-            query = substmt["sqlstmt"]["PLpgSQL_expr"]["query"]
+        if isinstance(stmt, ExecSqlStmt):
+            query = stmt.sql
             query_ast = parse_sql(query)[0].stmt
             if self.is_batchable(stmt):
                 local_vars = get_column_refs(query_ast).intersection(
@@ -412,38 +409,29 @@ class UdfRewriter:
                             for var_name in local_vars_list
                         }
                     )(query_ast)
-                substmt["sqlstmt"]["PLpgSQL_expr"]["query"] = IndentedStream()(
-                    query_ast
-                )
+                stmt.sql = IndentedStream()(query_ast)
 
-                self.put_batched_sql(substmt, block)
+                self.put_batched_sql(stmt, block)
             else:
                 select_stmt = query_ast[0].stmt
-                # print(query)
                 assert select_stmt.intoClause is not None
                 var_name = select_stmt.intoClause.rel.relname
                 select_stmt.intoClause = None
                 varno = self.get_varno(var_name)
                 self.put_looped_stmt(
-                    {
-                        "PLpgSQL_stmt_assign": {
-                            "varno": varno,
-                            "expr": {
-                                "PLpgSQL_expr": {"query": IndentedStream()(substmt)}
-                            },
-                        }
-                    },
-                    block,
+                    AssignStmt(IndentedStream()(stmt.sql), varno), block
                 )
-        elif "PLpgSQL_stmt_assign" in stmt:
-            substmt = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
+        elif isinstance(stmt, AssignStmt):
+            substmt = stmt.sql
             substmt = substmt[len("SELECT ") :]
             if self.is_batchable(stmt):
                 batched_sql = self.batch_query(substmt).split("\n")
-                varno = stmt["PLpgSQL_stmt_assign"]["varno"]
+                varno = stmt.varno
                 batched_sql[0] = "(" + batched_sql[0]
                 batched_sql[-1] = batched_sql[-1] + ");"
-                batched_sql[0] = gen_assign_stmt(self.vars[varno].name, batched_sql[0])
+                batched_sql[0] = gen_assign_stmt(
+                    self.udf_object.vars[varno].name, batched_sql[0]
+                )
                 block += batched_sql
             else:
                 self.put_looped_stmt(stmt, block)
@@ -451,15 +439,13 @@ class UdfRewriter:
             self.put_looped_stmt(stmt, block)
 
     def init_local_var_refs(self):
-        block = self.tree["action"]["PLpgSQL_stmt_block"]["body"]
+        block = self.udf_object.body
         for stmt in block:
             if self.is_batchable(stmt):
-                if "PLpgSQL_stmt_execsql" in stmt:
-                    query = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["PLpgSQL_expr"][
-                        "query"
-                    ]
-                elif "PLpgSQL_stmt_assign" in stmt:
-                    query = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
+                if isinstance(stmt, ExecSqlStmt):
+                    query = stmt.sql
+                elif isinstance(stmt, AssignStmt):
+                    query = stmt.sql
                 else:
                     raise Exception("Unknown statement type: " + str(stmt))
                 root_ast = parse_sql(query)
@@ -468,8 +454,8 @@ class UdfRewriter:
         self.local_var_refs = self.local_var_refs.intersection(self.local_var_names)
 
     def is_batchable(self, stmt):
-        if "PLpgSQL_stmt_execsql" in stmt:
-            query = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["PLpgSQL_expr"]["query"]
+        if isinstance(stmt, ExecSqlStmt):
+            query = stmt.sql
             tokens = scan(query)
             real_query = any(
                 token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM"
@@ -479,8 +465,8 @@ class UdfRewriter:
                 return True
             else:
                 return False
-        elif "PLpgSQL_stmt_assign" in stmt:
-            query = stmt["PLpgSQL_stmt_assign"]["expr"]["PLpgSQL_expr"]["query"]
+        elif isinstance(stmt, AssignStmt):
+            query = stmt.sql
             tokens = scan(query)
             real_query = any(
                 token.kind == "RESERVED_KEYWORD" and token.name.upper() == "FROM"
