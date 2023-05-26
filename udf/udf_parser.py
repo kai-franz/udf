@@ -28,51 +28,53 @@ class AssignStmt(UdfStmt):
 
 
 class ExecSqlStmt(UdfStmt):
-    def __init__(self, stmt):
-        self.sql = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["PLpgSQL_expr"]["query"]
-        if "target" in stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]:
-            self.into = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["target"][
-                "PLpgSQL_row"
-            ]["fields"][-1]["name"]
-        else:
-            self.into = None
+    def __init__(self, sql, into):
+        self.sql = sql
+        self.into = into
 
     @classmethod
     def from_dict(cls, stmt):
-        return cls(stmt)
+        sql = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["PLpgSQL_expr"]["query"]
+        if "target" in stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]:
+            into = stmt["PLpgSQL_stmt_execsql"]["sqlstmt"]["target"]["PLpgSQL_row"][
+                "fields"
+            ][-1]["name"]
+        else:
+            into = None
+        return cls(sql, into)
 
 
 class IfStmt(UdfStmt):
-    def __init__(self, stmt):
-        self.sql = stmt["PLpgSQL_stmt_if"]["cond"]["PLpgSQL_expr"]["query"]
-        if "then_body" in stmt["PLpgSQL_stmt_if"]:
-            self.then_body = [
-                parse_stmt(s) for s in stmt["PLpgSQL_stmt_if"]["then_body"]
-            ]
-        else:
-            self.then_body = None
-        if "else_body" in stmt["PLpgSQL_stmt_if"]:
-            self.else_body = [
-                parse_stmt(s) for s in stmt["PLpgSQL_stmt_if"]["else_body"]
-            ]
-        else:
-            self.else_body = None
+    def __init__(self, cond, then_body, else_body):
+        self.sql = cond
+        self.then_body = then_body
+        self.else_body = else_body
 
     @classmethod
     def from_dict(cls, stmt):
-        return cls(stmt)
+        cond = stmt["PLpgSQL_stmt_if"]["cond"]["PLpgSQL_expr"]["query"]
+        if "then_body" in stmt["PLpgSQL_stmt_if"]:
+            then_body = [parse_stmt(s) for s in stmt["PLpgSQL_stmt_if"]["then_body"]]
+        else:
+            then_body = None
+        if "else_body" in stmt["PLpgSQL_stmt_if"]:
+            else_body = [parse_stmt(s) for s in stmt["PLpgSQL_stmt_if"]["else_body"]]
+        else:
+            else_body = None
+        return cls(cond, then_body, else_body)
 
 
 class ReturnStmt(UdfStmt):
-    def __init__(self, stmt):
-        if "expr" not in stmt["PLpgSQL_stmt_return"]:
-            self.sql = None
-        else:
-            self.sql = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
+    def __init__(self, sql):
+        self.sql = sql
 
     @classmethod
     def from_dict(cls, stmt):
-        return cls(stmt)
+        if "expr" not in stmt["PLpgSQL_stmt_return"]:
+            ret_val = None
+        else:
+            ret_val = stmt["PLpgSQL_stmt_return"]["expr"]["PLpgSQL_expr"]["query"]
+        return cls(ret_val)
 
 
 def parse_stmt(stmt):
@@ -92,6 +94,16 @@ def parse_stmt(stmt):
     raise Exception(f"Unknown statement type: {stmt}")
 
 
+def count_if_stmts(stmt: UdfStmt):
+    if isinstance(stmt, IfStmt):
+        return (
+            1
+            + sum(count_if_stmts(s) for s in stmt.then_body)
+            + sum(count_if_stmts(s) for s in stmt.else_body)
+        )
+    return 0
+
+
 class Udf:
     def __init__(self, f: str):
         self.tree = parse_plpgsql(f)[0]["PLpgSQL_function"]
@@ -108,3 +120,5 @@ class Udf:
         self.body = [
             parse_stmt(s) for s in self.tree["action"]["PLpgSQL_stmt_block"]["body"]
         ]
+
+        self.num_if_stmts = sum(count_if_stmts(s) for s in self.body)
